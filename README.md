@@ -1,75 +1,153 @@
-# Claude Keep Rolling
+# Keep Rolling
 
-[![CI](https://github.com/265866/claude-keep-rolling/actions/workflows/ci.yml/badge.svg)](https://github.com/265866/claude-keep-rolling/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/265866/claude-keep-rolling)](https://github.com/265866/claude-keep-rolling/releases/latest)
+A [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) plugin that
+starts each account's **weekly** usage window right after its reset, so idle
+time does not delay the next window.
 
-A [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) plugin that keeps Claude five-hour usage windows rolling.
-
-A Claude usage window starts with the first message and resets five hours later. This plugin sends a tiny message through each selected Claude account one minute after its window resets, so a new window is always running.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/status-dark.png">
-  <img alt="The Claude Keep Rolling page, listing Claude accounts with their last ping, window reset, weekly usage and mode" src="docs/status-light.png">
-</picture>
+This is a fork of
+[265866/claude-keep-rolling](https://github.com/265866/claude-keep-rolling)
+v0.3.0 (MIT). The fork is generalized to several providers, tracks only the
+weekly window, and builds against CLIProxyAPI SDK v8.0.63. The source audit of
+upstream is in [AUDIT.md](AUDIT.md). Plugin ID: `keep-rolling`.
 
 ## How it works
 
-- Each ping goes through CLIProxyAPI's own Claude executor, pinned to one account.
-- Claude's reply reports when the window resets. The next ping is scheduled one minute after that.
-- If the reply shows only a weekly limit and no five-hour limit, as on verified Ultra accounts, scheduled pings stop. The account is pinged once, one minute after its weekly limit resets, in case the five-hour limit returns. If the reply gives no weekly reset time, it is pinged again after 24 hours.
-- If the reply shows the weekly limit is used up, the account is not pinged until one minute after the weekly reset, or for 24 hours if the reply gives no weekly reset time. Pings cannot move the weekly reset.
-- Only the weekly limit for all models counts. Model-specific weekly limits, such as Fable's, are ignored.
-- A failed ping is retried after 15 minutes, or just after CLIProxyAPI's cooldown for the account ends if that is later.
-- A ping is one short message with no tools, and the reply is capped at 1 token, so it uses almost none of the window.
-- Disabled accounts and Claude API keys are skipped.
-- Ping history is kept in memory. After CLIProxyAPI restarts, every selected account is pinged once to learn its reset time.
+- A provider adapter knows the provider's accounts, a minimal ping, and how
+  to read the weekly reset from the reply headers.
+- Each ping goes through `host.model.execute`, pinned to one account by its
+  auth ID, with `stream=false`. The plugin makes no direct network calls and
+  uses no management key. It declares only the management capability: it is
+  not a scheduler and does not change account selection.
+- After a successful ping, the next ping is at the reported weekly reset plus
+  a random delay (`delay_min` to `delay_max`, default 1 to 10 minutes).
+- After a start, first pings are spread at least `stagger` apart (default
+  2 minutes) with a random offset, so a restart sends no burst. Ping history
+  is in memory only, so after a restart every selected account is pinged once
+  to learn its reset.
+- Upstream retry rules are kept: a reset reported at or up to 10 minutes
+  before the ping means clock skew, retry in 2 minutes; a reply without a
+  usable reset is re-checked after 24 hours; a failed ping is retried after
+  15 minutes, or after the host cooldown plus 1 minute if that is later; a
+  failed manual ping does not move the scheduled ping.
+- A due ping for an account in an active host cooldown waits until the
+  cooldown ends, instead of failing into it.
+- There is no five-hour logic.
 
-## Install
+### Cooldown reset
 
-Requires CLIProxyAPI v8 with plugins enabled:
+A restored quota does not clear an active credential cooldown (CLIProxyAPI
+issue #7125). With `cooldown_reset: true` (default), on the first round after
+an account's known weekly reset passes (within 1 hour), the plugin checks the
+host's runtime state for the account. If the host shows a cooldown
+(`next_retry_after` in the future, or `unavailable`), it calls
+`host.routing.reset_cooldown` for that account once. The decision is made
+once per reset: a cooldown that starts later is left alone.
+
+The plugin learns resets only from its own ping replies (or the calendar, for
+meta). `host.auth.list` and `host.auth.get_runtime` do not expose the host's
+saved `quota.signals`, so the plugin cannot learn a reset without a ping.
+
+### Providers
+
+| Provider | Default | Window starts on first use | Reset source |
+| --- | --- | --- | --- |
+| claude | on | yes | `Anthropic-Ratelimit-Unified-7d-Reset` (Unix seconds or RFC 3339); `-7d-Status`, `-7d-Utilization` |
+| codex | on | yes | `X-Codex-Primary-*` / `X-Codex-Secondary-*`: the window of 10080 minutes, else the longest window of at least one day; `-Reset-At` (Unix seconds), else `-Reset-After-Seconds`; `-Used-Percent` |
+| meta | off | no (fixed Monday 00:00 UTC) | calendar; never pinged; cooldown reset at the Monday reset only |
+| xai | off | unknown | none in headers; stub, no ping |
+| antigravity | off | unknown | none known; stub, no ping |
+
+Pings:
+
+- claude: Claude Messages, `max_tokens: 1`, no tools. Default model
+  `claude-haiku-4-5-20251001`.
+- codex: OpenAI Responses (`openai-response` in and out, forced provider
+  `codex`), `instructions: ""`, `input` = prompt, `max_output_tokens: 16`
+  (the Codex minimum), `store: false`. The host sends `stream: true` upstream
+  and aggregates the reply. Default model `gpt-6-luna`.
+
+Only OAuth accounts are used. API-key accounts and disabled accounts are
+skipped.
+
+## Configuration
+
+Under `plugins.configs.keep-rolling` in `config.yaml`. The plugin acts only
+when `plugins.enabled` and `plugins.configs.keep-rolling.enabled` are both
+true (it reads these two flags from the host config file, see AUDIT.md F3).
 
 ```yaml
 plugins:
   enabled: true
-```
-
-Open **Plugin Store** in the Management Center and install **Claude Keep Rolling**. It runs on macOS (Apple Silicon and Intel), Linux (x64 and Arm) and Windows (x64).
-
-## Use
-
-Open **Claude Keep Rolling** in the Management Center sidebar.
-
-- **Accounts**: each account shows its weekly usage and its mode: **Rolling**, **No 5-hour limit** with the next re-check, or **Weekly limit reached** with the time pings resume. Check the accounts to keep rolling. **Select all** includes accounts you add later. Unchecking any account switches to only the accounts you have checked.
-- **Settings**: the model and prompt for each ping. The model list shows the Claude models CLIProxyAPI offers. The default is Claude Haiku 4.5.
-- **Ping now** sends a ping immediately. If it fails, the next scheduled ping still runs on time, and an account waiting for its weekly reset keeps waiting.
-
-The page reuses the management key the Management Center saved if you logged in with **Remember password**. Otherwise it asks for the key and keeps it for the current tab only.
-
-Disabling the plugin stops pings within 30 seconds. If your CLIProxyAPI config is not stored in a file, pings continue until CLIProxyAPI restarts.
-
-## Configuration
-
-The page saves its settings under the plugin's entry in `config.yaml`:
-
-```yaml
-plugins:
   configs:
-    claude-keep-rolling:
+    keep-rolling:
       enabled: true
-      model: claude-haiku-4-5-20251001  # default
-      prompt: hi                         # default
-      select_all: true                   # default
-      accounts: []                       # account IDs, used when select_all is false
+      prompt: hi            # default
+      delay_min: 1m         # default; at least 1m
+      delay_max: 10m        # default; at most 6h
+      stagger: 2m           # default; 0s to 1h, 0s turns it off
+      cooldown_reset: true  # default
+      providers:            # every key is optional
+        claude:
+          enabled: true
+          model: claude-haiku-4-5-20251001
+          select_all: true  # false: only the IDs in accounts
+          accounts: []
+        codex:
+          enabled: true
+          model: gpt-6-luna
+        meta:
+          enabled: false
 ```
+
+Durations are Go duration strings or integer seconds. An invalid config keeps
+the previous settings and shows the error on the status page. An unknown
+provider key is an error.
+
+## Status page
+
+**Keep Rolling** in the Management Center sidebar
+(`/v0/resource/plugins/keep-rolling/status`). It asks for the management key
+and keeps it in `sessionStorage` for the tab only. It shows, for each account:
+provider, last ping, weekly use and reset, last reset seen, next ping, host
+cooldown, and a **Ping now** button. Providers can be switched on and off and
+their model set. Saves go through
+`PATCH /v0/management/plugins/keep-rolling/config` (shallow merge; the page
+sends the whole `providers` object).
+
+Management API: `GET /v0/management/keep-rolling/state`,
+`POST /v0/management/keep-rolling/ping` with `{"id": "<auth id>"}`.
+
+## Build (linux/arm64)
+
+With the system Go toolchain on an arm64 host:
+
+```sh
+export GOTOOLCHAIN=local
+go vet ./...
+go test -race ./...
+CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -trimpath -buildmode=c-shared \
+  -ldflags "-s -w -X main.pluginVersion=0.4.0" \
+  -o dist/keep-rolling-v0.4.0-linux-arm64.so .
+```
+
+The host takes the plugin ID and version from the file name
+`<id>-v<version>.so`. Install the library as
+`plugins/linux/arm64/keep-rolling-v0.4.0.so`. The host hot-reloads a plugin
+only when its file path changes.
+
+Before installing, remove the old `claude-keep-rolling` plugin. Its ID differs,
+so both would run and ping at the same time.
+
+Upstream builds release libraries in `golang:1.26-bookworm` to match the glibc
+of the official CLIProxyAPI image (`scripts/release.sh`). A library built on
+another host can need newer glibc symbols; check with
+`objdump -T <lib> | grep GLIBC_` before installing.
 
 ## Account risk
 
-Anthropic restricts the use of Claude subscription logins through third-party tools. Using CLIProxyAPI with Claude accounts, and sending scheduled pings through them, may put those accounts at risk. Use it at your own discretion.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing and releasing.
+Automated pings through subscription logins can break provider terms and put
+the accounts at risk. Use at your own discretion.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Upstream copyright is kept.

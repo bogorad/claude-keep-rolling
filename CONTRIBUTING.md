@@ -6,7 +6,8 @@
 | --- | --- |
 | `plugin.go` | Registration, management routes and the plugin page |
 | `roller.go` | The scheduler that pings each account |
-| `internal/rolling` | Host-independent rules: settings, account selection and ping timing |
+| `internal/provider` | One adapter per provider: account filter, minimal ping, weekly reset parser |
+| `internal/rolling` | Host-independent rules: settings, account selection, ping timing, stagger and cooldown-reset decision |
 | `main.go`, `entry.c`, `abi.h` | The C ABI between CLIProxyAPI and the plugin |
 | `status.html` | The plugin page, embedded in the library |
 | `test/faulthost` | A minimal Go host that loads the plugin the way CLIProxyAPI does and checks that it still recovers its own faults |
