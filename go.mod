@@ -1,4 +1,4 @@
-module github.com/265866/claude-keep-rolling
+module github.com/bogorad/claude-keep-rolling
 
 go 1.26.10
 

@@ -7,7 +7,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/265866/claude-keep-rolling/internal/rolling"
+	"github.com/bogorad/claude-keep-rolling/internal/provider"
+	"github.com/bogorad/claude-keep-rolling/internal/rolling"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -16,8 +17,8 @@ import (
 var pluginVersion = "0.0.0-dev"
 
 const (
-	pluginID   = "claude-keep-rolling"
-	repository = "https://github.com/265866/claude-keep-rolling"
+	pluginID   = "keep-rolling"
+	repository = "https://github.com/bogorad/claude-keep-rolling"
 
 	statePath  = "/v0/management/" + pluginID + "/state"
 	pingPath   = "/v0/management/" + pluginID + "/ping"
@@ -31,6 +32,8 @@ type lifecycleRequest struct {
 	ConfigYAML []byte `json:"config_yaml"`
 }
 
+// registration declares only the management capability. keep-rolling is not
+// a scheduler and does not change account selection (ADR-028 §4).
 type registration struct {
 	SchemaVersion uint32             `json:"schema_version"`
 	Metadata      pluginapi.Metadata `json:"metadata"`
@@ -89,11 +92,11 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodManagementRegister:
 		return okEnvelope(managementRegistration{
 			Routes: []managementRoute{
-				{Method: http.MethodGet, Path: statePath, Description: "Claude accounts, settings and ping schedule."},
-				{Method: http.MethodPost, Path: pingPath, Description: "Ping one Claude account now."},
+				{Method: http.MethodGet, Path: statePath, Description: "Accounts, providers, settings and ping schedule."},
+				{Method: http.MethodPost, Path: pingPath, Description: "Ping one account now."},
 			},
 			Resources: []managementResource{
-				{Path: statusPath, Menu: "Claude Keep Rolling", Description: "Keeps Claude five-hour usage windows rolling."},
+				{Path: statusPath, Menu: "Keep Rolling", Description: "Starts each account's weekly usage window right after its reset."},
 			},
 		})
 	case pluginabi.MethodManagementHandle:
@@ -111,15 +114,17 @@ func pluginRegistration() registration {
 	reg := registration{
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
-			Name:             "Claude Keep Rolling",
+			Name:             "Keep Rolling",
 			Version:          pluginVersion,
-			Author:           "265866",
+			Author:           "bogorad (fork of 265866/claude-keep-rolling)",
 			GitHubRepository: repository,
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "model", Type: pluginapi.ConfigFieldTypeString, Description: "Model used for each ping. Defaults to " + rolling.DefaultModel + "."},
-				{Name: "prompt", Type: pluginapi.ConfigFieldTypeString, Description: "Message sent with each ping. Defaults to " + rolling.DefaultPrompt + "."},
-				{Name: "select_all", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Keep every Claude account rolling, including accounts added later. Defaults to true."},
-				{Name: "accounts", Type: pluginapi.ConfigFieldTypeArray, Description: "Account IDs to keep rolling when select_all is false."},
+				{Name: "prompt", Type: pluginapi.ConfigFieldTypeString, Default: rolling.DefaultPrompt, Description: "Message sent with each ping."},
+				{Name: "delay_min", Type: pluginapi.ConfigFieldTypeString, Default: rolling.DefaultDelayMin.String(), Description: "Smallest random delay after a weekly reset (Go duration, at least 1m)."},
+				{Name: "delay_max", Type: pluginapi.ConfigFieldTypeString, Default: rolling.DefaultDelayMax.String(), Description: "Largest random delay after a weekly reset (Go duration, at most 6h)."},
+				{Name: "stagger", Type: pluginapi.ConfigFieldTypeString, Default: rolling.DefaultStagger.String(), Description: "Minimum gap between first pings after a start (Go duration, 0s to 1h)."},
+				{Name: "cooldown_reset", Type: pluginapi.ConfigFieldTypeBoolean, Default: true, Description: "Clear an active host cooldown once, right after an account's weekly reset."},
+				{Name: "providers", Type: pluginapi.ConfigFieldTypeObject, Description: "Per provider (claude, codex, meta, xai, antigravity): enabled, model, select_all, accounts."},
 			},
 		},
 	}
@@ -145,21 +150,40 @@ func handleManagement(req managementRequest) managementResponse {
 }
 
 type accountView struct {
-	ID         string     `json:"id"`
-	Name       string     `json:"name"`
-	Disabled   bool       `json:"disabled"`
-	Selected   bool       `json:"selected"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+	Disabled bool   `json:"disabled"`
+	Selected bool   `json:"selected"`
+	// Rolling reports that the plugin pings this account.
+	Rolling    bool       `json:"rolling"`
 	Pinging    bool       `json:"pinging"`
 	LastPingAt *time.Time `json:"last_ping_at,omitempty"`
 	LastOK     bool       `json:"last_ok"`
 	LastStatus int        `json:"last_status,omitempty"`
 	LastError  string     `json:"last_error,omitempty"`
-	ResetAt    *time.Time `json:"reset_at,omitempty"`
-	// Mode and the weekly fields come from the last successful ping.
-	Mode              rolling.Mode `json:"mode,omitempty"`
-	WeeklyResetAt     *time.Time   `json:"weekly_reset_at,omitempty"`
-	WeeklyUtilization *float64     `json:"weekly_utilization,omitempty"`
-	NextPingAt        *time.Time   `json:"next_ping_at,omitempty"`
+	// The weekly fields come from the last successful ping.
+	WeeklyResetAt     *time.Time `json:"weekly_reset_at,omitempty"`
+	WeeklyUtilization *float64   `json:"weekly_utilization,omitempty"`
+	WeeklyReached     bool       `json:"weekly_reached,omitempty"`
+	LastResetSeen     *time.Time `json:"last_reset_seen,omitempty"`
+	NextPingAt        *time.Time `json:"next_ping_at,omitempty"`
+	// Host runtime state.
+	Unavailable     bool       `json:"unavailable,omitempty"`
+	NextRetryAfter  *time.Time `json:"next_retry_after,omitempty"`
+	CooldownResetAt *time.Time `json:"cooldown_reset_at,omitempty"`
+}
+
+type providerView struct {
+	ID               string     `json:"id"`
+	Name             string     `json:"name"`
+	Enabled          bool       `json:"enabled"`
+	DefaultEnabled   bool       `json:"default_enabled"`
+	StartsOnFirstUse bool       `json:"starts_on_first_use"`
+	CanPing          bool       `json:"can_ping"`
+	DefaultModel     string     `json:"default_model"`
+	FixedResetAt     *time.Time `json:"fixed_reset_at,omitempty"`
+	Note             string     `json:"note"`
 }
 
 type stateView struct {
@@ -168,6 +192,7 @@ type stateView struct {
 	Settings    rolling.Settings `json:"settings"`
 	Defaults    rolling.Settings `json:"defaults"`
 	ConfigError string           `json:"config_error,omitempty"`
+	Providers   []providerView   `json:"providers"`
 	Accounts    []accountView    `json:"accounts"`
 	ListError   string           `json:"list_error,omitempty"`
 }
@@ -175,34 +200,68 @@ type stateView struct {
 func buildState(now time.Time) stateView {
 	settings, configError := keeper.currentSettings()
 	defaults, _ := rolling.ParseSettings(nil)
-	view := stateView{Version: pluginVersion, Now: now.UTC(), Settings: settings, Defaults: defaults, ConfigError: configError, Accounts: []accountView{}}
-	accounts, err := listClaudeAccounts()
+	view := stateView{
+		Version: pluginVersion, Now: now.UTC(), Settings: settings, Defaults: defaults,
+		ConfigError: configError, Providers: providerViews(settings, now), Accounts: []accountView{},
+	}
+	accounts, err := listAccounts()
 	if err != nil {
 		view.ListError = err.Error()
 		return view
 	}
 	for _, account := range accounts {
-		item := accountView{
-			ID:       account.ID,
-			Name:     accountName(account),
-			Disabled: account.Disabled,
-			Selected: settings.Selected(account.ID),
-		}
-		if state, ok := keeper.snapshot(account.ID); ok {
-			item.Pinging = state.Pinging
-			item.LastPingAt = timeOrNil(state.LastPingAt)
-			item.LastOK = state.LastOK
-			item.LastStatus = state.LastStatus
-			item.LastError = state.LastError
-			item.ResetAt = timeOrNil(state.Limits.FiveHourReset)
-			item.Mode = state.Mode
-			item.WeeklyResetAt = timeOrNil(state.Limits.WeeklyReset)
-			item.WeeklyUtilization = state.Limits.WeeklyUtilization
-			item.NextPingAt = timeOrNil(state.NextPingAt)
-		}
-		view.Accounts = append(view.Accounts, item)
+		view.Accounts = append(view.Accounts, buildAccountView(account, settings))
 	}
 	return view
+}
+
+func providerViews(settings rolling.Settings, now time.Time) []providerView {
+	var views []providerView
+	for _, adapter := range provider.All() {
+		item := providerView{
+			ID:               adapter.ID(),
+			Name:             adapter.Name(),
+			Enabled:          settings.Provider(adapter.ID()).Enabled,
+			DefaultEnabled:   adapter.DefaultEnabled(),
+			StartsOnFirstUse: adapter.StartsOnFirstUse(),
+			CanPing:          provider.CanPing(adapter),
+			DefaultModel:     adapter.DefaultModel(),
+			Note:             adapter.Note(),
+		}
+		if fixed := adapter.FixedReset(now); !fixed.IsZero() {
+			item.FixedResetAt = timeOrNil(fixed.Add(provider.Week))
+		}
+		views = append(views, item)
+	}
+	return views
+}
+
+func buildAccountView(account tracked, settings rolling.Settings) accountView {
+	p := settings.Provider(account.adapter.ID())
+	item := accountView{
+		ID:             account.entry.ID,
+		Name:           accountName(account.entry),
+		Provider:       account.adapter.ID(),
+		Disabled:       account.entry.Disabled,
+		Selected:       p.Selected(account.entry.ID),
+		Rolling:        active(account, settings) && provider.CanPing(account.adapter),
+		Unavailable:    account.entry.Unavailable,
+		NextRetryAfter: timeOrNil(account.entry.NextRetryAfter),
+	}
+	if state, ok := keeper.snapshot(account.entry.ID); ok {
+		item.Pinging = state.Pinging
+		item.LastPingAt = timeOrNil(state.LastPingAt)
+		item.LastOK = state.LastOK
+		item.LastStatus = state.LastStatus
+		item.LastError = state.LastError
+		item.WeeklyResetAt = timeOrNil(state.Weekly.Reset)
+		item.WeeklyUtilization = state.Weekly.Utilization
+		item.WeeklyReached = state.Weekly.Reached
+		item.LastResetSeen = timeOrNil(state.LastResetSeen)
+		item.NextPingAt = timeOrNil(state.NextPingAt)
+		item.CooldownResetAt = timeOrNil(state.CooldownResetAt)
+	}
+	return item
 }
 
 func handlePing(req managementRequest) managementResponse {
@@ -212,25 +271,28 @@ func handlePing(req managementRequest) managementResponse {
 	if err := json.Unmarshal(req.Body, &body); err != nil || body.ID == "" {
 		return jsonResponse(http.StatusBadRequest, map[string]string{"error": "body must be {\"id\": \"<account id>\"}"})
 	}
-	accounts, err := listClaudeAccounts()
+	accounts, err := listAccounts()
 	if err != nil {
 		return jsonResponse(http.StatusBadGateway, map[string]string{"error": err.Error()})
 	}
 	for _, account := range accounts {
-		if account.ID != body.ID {
+		if account.entry.ID != body.ID {
 			continue
 		}
-		if account.Disabled {
+		if account.entry.Disabled {
 			return jsonResponse(http.StatusConflict, map[string]string{"error": "account is disabled"})
 		}
-		if !keeper.claim(account.ID) {
+		if !provider.CanPing(account.adapter) {
+			return jsonResponse(http.StatusConflict, map[string]string{"error": account.adapter.Name() + " has no ping: " + account.adapter.Note()})
+		}
+		if !keeper.claim(account) {
 			return jsonResponse(http.StatusConflict, map[string]string{"error": "a ping is already running for this account"})
 		}
 		settings, _ := keeper.currentSettings()
 		keeper.ping(account, settings, true)
 		return jsonResponse(http.StatusOK, buildState(time.Now()))
 	}
-	return jsonResponse(http.StatusNotFound, map[string]string{"error": "Claude account not found"})
+	return jsonResponse(http.StatusNotFound, map[string]string{"error": "account not found"})
 }
 
 func jsonResponse(status int, v any) managementResponse {

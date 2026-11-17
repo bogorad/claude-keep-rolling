@@ -130,7 +130,7 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
           CPA_VERSION: ${{ needs.version.outputs.cpa-version }}
           CPA_ASSET: ${{ matrix.cpa-asset }}
-        run: ./scripts/smoke-test.sh "dist/claude-keep-rolling_${VERSION}_${{ matrix.target }}.zip"
+        run: ./scripts/smoke-test.sh "dist/keep-rolling_${VERSION}_${{ matrix.target }}.zip"
       - uses: actions/setup-go@v7
         if: runner.os != 'Windows'
         with:
@@ -141,10 +141,10 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           mkdir -p faulthost-plugin
-          unzip -q -o "dist/claude-keep-rolling_${VERSION}_${{ matrix.target }}.zip" -d faulthost-plugin
+          unzip -q -o "dist/keep-rolling_${VERSION}_${{ matrix.target }}.zip" -d faulthost-plugin
           go build -o faulthost-bin ./test/faulthost
           # Longer than the plugin's 20 s startup delay, so its own loop calls the host too.
-          ./faulthost-bin -for 30s faulthost-plugin/claude-keep-rolling.*
+          ./faulthost-bin -for 30s faulthost-plugin/keep-rolling.*
 
   assemble:
     needs: [version, smoke]
@@ -165,12 +165,12 @@ jobs:
         run: |
           cd dist
           for target in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64 windows_amd64; do
-            zip="claude-keep-rolling_${VERSION}_${target}.zip"
+            zip="keep-rolling_${VERSION}_${target}.zip"
             test -f "$zip"
             # Store reviewers match each library to the release tag by its stamped commit.
             mkdir -p "check/$target"
             unzip -q -o "$zip" -d "check/$target"
-            info=$(go version -m "check/$target"/claude-keep-rolling.*)
+            info=$(go version -m "check/$target"/keep-rolling.*)
             grep -qx $'\tbuild\tvcs.revision='"$GITHUB_SHA" <<<"$info" || { echo "$zip is not stamped with $GITHUB_SHA" >&2; echo "$info" >&2; exit 1; }
             grep -qx $'\tbuild\tvcs.modified=false' <<<"$info" || { echo "$zip was built from a modified tree" >&2; echo "$info" >&2; exit 1; }
           done

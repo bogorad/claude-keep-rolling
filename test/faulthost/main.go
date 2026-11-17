@@ -5,7 +5,7 @@
 // Both are Go runtimes in one process, so a plugin that takes over the host's
 // fault handling turns those recoverable panics into a crash.
 //
-//	faulthost [-for 15s] path/to/claude-keep-rolling.{so,dylib}
+//	faulthost [-for 15s] path/to/keep-rolling.{so,dylib}
 package main
 
 /*
@@ -133,7 +133,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for time.Now().Before(stop) {
-				callPlugin("management.handle", `{"Method":"GET","Path":"/v0/management/claude-keep-rolling/state"}`)
+				callPlugin("management.handle", `{"Method":"GET","Path":"/v0/management/keep-rolling/state"}`)
 				calls.Add(1)
 			}
 		}()

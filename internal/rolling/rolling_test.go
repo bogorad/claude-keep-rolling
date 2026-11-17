@@ -1,11 +1,12 @@
 package rolling
 
 import (
-	"net/http"
+	"encoding/json"
 	"path/filepath"
-	"strconv"
 	"testing"
 	"time"
+
+	"github.com/bogorad/claude-keep-rolling/internal/provider"
 )
 
 func TestParseSettingsDefaults(t *testing.T) {
@@ -13,86 +14,227 @@ func TestParseSettingsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if settings.Model != "claude-haiku-4-5-20251001" || settings.Prompt != "hi" || !settings.SelectAll || len(settings.Accounts) != 0 {
+	if settings.Prompt != DefaultPrompt || time.Duration(settings.DelayMin) != time.Minute || time.Duration(settings.DelayMax) != 10*time.Minute ||
+		time.Duration(settings.Stagger) != 2*time.Minute || !settings.CooldownReset {
 		t.Fatalf("unexpected defaults: %+v", settings)
+	}
+	want := map[string]bool{"claude": true, "codex": true, "meta": false, "xai": false, "antigravity": false}
+	if len(settings.Providers) != len(want) {
+		t.Fatalf("providers = %v", settings.Providers)
+	}
+	for id, enabled := range want {
+		p := settings.Provider(id)
+		adapter, _ := provider.Get(id)
+		if p.Enabled != enabled || !p.SelectAll || p.Model != adapter.DefaultModel() || p.Accounts == nil {
+			t.Fatalf("%s defaults: %+v", id, p)
+		}
+	}
+	if settings.Provider("unknown").Enabled {
+		t.Fatal("an unknown provider must be disabled")
 	}
 }
 
 func TestParseSettingsExplicit(t *testing.T) {
 	raw := []byte(`
 enabled: true
-store:
-  id: claude-keep-rolling
-model: claude-sonnet-4-6
 prompt: "  hello there "
-select_all: false
-accounts:
-  - claude-a@example.com.json
-  - claude-b@example.com.json
+delay_min: 2m
+delay_max: 900
+stagger: 30s
+cooldown_reset: false
+providers:
+  claude:
+    enabled: false
+    model: claude-sonnet-4-6
+  codex:
+    select_all: false
+    accounts: [codex-a.json, codex-b.json]
+  meta:
+    enabled: true
 `)
 	settings, err := ParseSettings(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if settings.Model != "claude-sonnet-4-6" {
-		t.Fatalf("model = %q", settings.Model)
-	}
 	if settings.Prompt != "  hello there " {
 		t.Fatalf("prompt should be sent as typed, got %q", settings.Prompt)
 	}
-	if settings.SelectAll {
-		t.Fatal("select_all should be false")
+	if time.Duration(settings.DelayMin) != 2*time.Minute || time.Duration(settings.DelayMax) != 15*time.Minute || time.Duration(settings.Stagger) != 30*time.Second {
+		t.Fatalf("durations: %+v", settings)
 	}
-	if !settings.Selected("claude-b@example.com.json") || settings.Selected("claude-c@example.com.json") {
-		t.Fatalf("selection mismatch: %+v", settings.Accounts)
+	if settings.CooldownReset {
+		t.Fatal("cooldown_reset should be false")
+	}
+	claude := settings.Provider("claude")
+	if claude.Enabled || claude.Model != "claude-sonnet-4-6" || !claude.SelectAll {
+		t.Fatalf("claude: %+v", claude)
+	}
+	codex := settings.Provider("codex")
+	if !codex.Enabled || codex.SelectAll || !codex.Selected("codex-b.json") || codex.Selected("codex-c.json") || codex.Model != "gpt-6-luna" {
+		t.Fatalf("codex: %+v", codex)
+	}
+	if !settings.Provider("meta").Enabled {
+		t.Fatal("meta should be enabled")
 	}
 }
 
-func TestParseSettingsBlankValuesFallBack(t *testing.T) {
-	settings, err := ParseSettings([]byte("model: \"  \"\nprompt: \"\"\n"))
+func TestParseSettingsErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{"invalid yaml", "providers: [unclosed"},
+		{"unknown provider", "providers:\n  gemini:\n    enabled: true\n"},
+		{"bad duration", "delay_min: soon\n"},
+		{"delay below minimum", "delay_min: 30s\n"},
+		{"max below min", "delay_min: 5m\ndelay_max: 2m\n"},
+		{"max above bound", "delay_max: 7h\n"},
+		{"negative stagger", "stagger: -1s\n"},
+		{"stagger above bound", "stagger: 2h\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ParseSettings([]byte(tc.raw)); err == nil {
+				t.Fatal("expected an error")
+			}
+		})
+	}
+}
+
+func TestParseSettingsBlankPromptFallsBack(t *testing.T) {
+	settings, err := ParseSettings([]byte("prompt: \"  \"\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if settings.Model != DefaultModel || settings.Prompt != DefaultPrompt {
-		t.Fatalf("blank values should fall back: %+v", settings)
+	if settings.Prompt != DefaultPrompt {
+		t.Fatalf("prompt = %q", settings.Prompt)
 	}
 }
 
-func TestParseSettingsRejectsInvalidYAML(t *testing.T) {
-	if _, err := ParseSettings([]byte("accounts: [unclosed")); err == nil {
-		t.Fatal("expected an error")
+func TestDurationJSON(t *testing.T) {
+	var d struct {
+		A Duration `json:"a"`
+		B Duration `json:"b"`
+	}
+	if err := json.Unmarshal([]byte(`{"a":"90s","b":120}`), &d); err != nil {
+		t.Fatal(err)
+	}
+	if time.Duration(d.A) != 90*time.Second || time.Duration(d.B) != 2*time.Minute {
+		t.Fatalf("decoded %v %v", time.Duration(d.A), time.Duration(d.B))
+	}
+	out, err := json.Marshal(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != `{"a":"1m30s","b":"2m0s"}` {
+		t.Fatalf("encoded %s", out)
+	}
+	if err := json.Unmarshal([]byte(`{"a":true}`), &d); err == nil {
+		t.Fatal("expected an error for a boolean duration")
 	}
 }
 
 func TestSelectAllIncludesUnknownAccounts(t *testing.T) {
-	settings := Settings{SelectAll: true}
-	if !settings.Selected("claude-added-later.json") {
+	if !(ProviderSettings{SelectAll: true}).Selected("added-later.json") {
 		t.Fatal("select all must include accounts added later")
+	}
+	if (ProviderSettings{}).Selected("x.json") {
+		t.Fatal("an empty selection must include nothing")
+	}
+}
+
+func TestJitterBounds(t *testing.T) {
+	minDelay, maxDelay := time.Minute, 10*time.Minute
+	for _, frac := range []float64{-1, 0, 0.001, 0.25, 0.5, 0.999999, 1, 2} {
+		got := Jitter(minDelay, maxDelay, frac)
+		if got < minDelay || got > maxDelay {
+			t.Fatalf("Jitter(%v) = %s, outside [%s, %s]", frac, got, minDelay, maxDelay)
+		}
+	}
+	if got := Jitter(minDelay, maxDelay, 0); got != minDelay {
+		t.Fatalf("Jitter(0) = %s", got)
+	}
+	if got := Jitter(minDelay, maxDelay, 0.5); got != 5*time.Minute+30*time.Second {
+		t.Fatalf("Jitter(0.5) = %s", got)
+	}
+	if got := Jitter(5*time.Minute, 5*time.Minute, 0.7); got != 5*time.Minute {
+		t.Fatalf("equal bounds: %s", got)
+	}
+	if got := Jitter(5*time.Minute, time.Minute, 0.7); got != 5*time.Minute {
+		t.Fatalf("inverted bounds: %s", got)
+	}
+}
+
+func TestNextSlotStaggers(t *testing.T) {
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	step := 2 * time.Minute
+	cases := []struct {
+		name string
+		now  time.Time
+		last time.Time
+		frac float64
+		want time.Time
+	}{
+		{"first slot", now, time.Time{}, 0, now},
+		{"first slot with offset", now, time.Time{}, 0.5, now.Add(30 * time.Second)},
+		{"after previous slot", now, now.Add(time.Minute), 0, now.Add(3 * time.Minute)},
+		{"previous slot long past", now, now.Add(-time.Hour), 0, now},
+		{"no stagger", now, now.Add(time.Minute), 0.9, now},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := step
+			if tc.name == "no stagger" {
+				s = 0
+			}
+			if got := NextSlot(tc.now, tc.last, s, tc.frac); !got.Equal(tc.want) {
+				t.Fatalf("NextSlot = %s, want %s", got, tc.want)
+			}
+		})
+	}
+
+	// Ten accounts found in one round: slots are at least one step apart and
+	// never before now.
+	var last time.Time
+	for i := range 10 {
+		slot := NextSlot(now, last, step, float64(i%3)/3)
+		if slot.Before(now) {
+			t.Fatalf("slot %d before now", i)
+		}
+		if !last.IsZero() && slot.Sub(last) < step {
+			t.Fatalf("slot %d only %s after the previous one", i, slot.Sub(last))
+		}
+		last = slot
 	}
 }
 
 func TestNextPing(t *testing.T) {
-	at := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
-	reset := at.Add(4*time.Hour + 30*time.Minute)
+	at := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	delay := 4 * time.Minute
+	reset := at.Add(3 * 24 * time.Hour)
+	weekly := func(r time.Time) provider.Weekly { return provider.Weekly{Seen: true, Reset: r, Window: provider.Week} }
 	cases := []struct {
 		name    string
 		outcome Outcome
 		want    time.Time
 	}{
-		{"success with reset", Outcome{At: at, OK: true, Limits: fiveHour(reset)}, reset.Add(time.Minute)},
-		{"success without reset", Outcome{At: at, OK: true}, at.Add(5*time.Hour + time.Minute)},
-		{"reset just passed (fast clock)", Outcome{At: at, OK: true, Limits: fiveHour(at.Add(-time.Second))}, at.Add(2 * time.Minute)},
-		{"reset exactly now", Outcome{At: at, OK: true, Limits: fiveHour(at)}, at.Add(2 * time.Minute)},
-		{"reset at skew tolerance", Outcome{At: at, OK: true, Limits: fiveHour(at.Add(-10 * time.Minute))}, at.Add(2 * time.Minute)},
-		{"reset long past", Outcome{At: at, OK: true, Limits: fiveHour(at.Add(-11 * time.Minute))}, at.Add(5*time.Hour + time.Minute)},
-		{"failure", Outcome{At: at, OK: false, Limits: fiveHour(reset)}, at.Add(15 * time.Minute)},
-		{"failure with short cooldown", Outcome{At: at, OK: false, CooldownUntil: at.Add(5 * time.Minute)}, at.Add(15 * time.Minute)},
-		{"failure with window cooldown", Outcome{At: at, OK: false, CooldownUntil: reset}, reset.Add(time.Minute)},
-		{"failed manual ping keeps an earlier schedule", Outcome{At: at, OK: false, Manual: true, Scheduled: at.Add(5 * time.Minute)}, at.Add(5 * time.Minute)},
-		{"failed manual ping retries before a later schedule", Outcome{At: at, OK: false, Manual: true, Scheduled: reset}, at.Add(15 * time.Minute)},
-		{"failed manual ping without a schedule", Outcome{At: at, OK: false, Manual: true}, at.Add(15 * time.Minute)},
-		{"failed scheduled ping ignores the old schedule", Outcome{At: at, OK: false, Scheduled: at.Add(5 * time.Minute)}, at.Add(15 * time.Minute)},
-		{"successful manual ping follows the new window", Outcome{At: at, OK: true, Limits: fiveHour(reset), Manual: true, Scheduled: at.Add(5 * time.Minute)}, reset.Add(time.Minute)},
+		{"reset ahead", Outcome{At: at, OK: true, Weekly: weekly(reset), Delay: delay}, reset.Add(delay)},
+		{"new window just started", Outcome{At: at, OK: true, Weekly: weekly(at.Add(provider.Week)), Delay: delay}, at.Add(provider.Week + delay)},
+		{"weekly limit used up waits for reset", Outcome{At: at, OK: true, Weekly: provider.Weekly{Seen: true, Reset: reset, Window: provider.Week, Reached: true}, Delay: delay}, reset.Add(delay)},
+		{"zero window defaults to a week", Outcome{At: at, OK: true, Weekly: provider.Weekly{Reset: at.Add(provider.Week)}, Delay: delay}, at.Add(provider.Week + delay)},
+		{"reset too far ahead", Outcome{At: at, OK: true, Weekly: weekly(at.Add(provider.Week + 2*time.Hour)), Delay: delay}, at.Add(RecheckFallback)},
+		{"longer reported window allows a later reset", Outcome{At: at, OK: true, Weekly: provider.Weekly{Reset: at.Add(8 * 24 * time.Hour), Window: 8 * 24 * time.Hour}, Delay: delay}, at.Add(8*24*time.Hour + delay)},
+		{"reset at ping time is clock skew", Outcome{At: at, OK: true, Weekly: weekly(at), Delay: delay}, at.Add(SkewRetry)},
+		{"reset just before ping is clock skew", Outcome{At: at, OK: true, Weekly: weekly(at.Add(-SkewTolerance)), Delay: delay}, at.Add(SkewRetry)},
+		{"stale reset", Outcome{At: at, OK: true, Weekly: weekly(at.Add(-time.Hour)), Delay: delay}, at.Add(RecheckFallback)},
+		{"no reset", Outcome{At: at, OK: true, Delay: delay}, at.Add(RecheckFallback)},
+		{"failure", Outcome{At: at}, at.Add(RetryAfterFailure)},
+		{"failure with later cooldown", Outcome{At: at, CooldownUntil: at.Add(time.Hour)}, at.Add(time.Hour + ResetBuffer)},
+		{"failure with short cooldown", Outcome{At: at, CooldownUntil: at.Add(time.Minute)}, at.Add(RetryAfterFailure)},
+		{"failed manual ping keeps the schedule", Outcome{At: at, Manual: true, Scheduled: reset.Add(delay)}, reset.Add(delay)},
+		{"failed manual ping keeps an earlier schedule", Outcome{At: at, Manual: true, Scheduled: at.Add(time.Minute)}, at.Add(time.Minute)},
+		{"failed manual ping without schedule", Outcome{At: at, Manual: true}, at.Add(RetryAfterFailure)},
+		{"successful manual ping reschedules", Outcome{At: at, OK: true, Manual: true, Scheduled: at.Add(time.Minute), Weekly: weekly(reset), Delay: delay}, reset.Add(delay)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -103,268 +245,61 @@ func TestNextPing(t *testing.T) {
 	}
 }
 
-func fiveHour(reset time.Time) Limits {
-	return Limits{FiveHour: true, FiveHourReset: reset}
-}
-
-func unix(t time.Time) string {
-	return strconv.FormatInt(t.Unix(), 10)
-}
-
-// TestScheduleFromHeaders feeds reply headers through ParseLimits and NextPing.
-// The "live" cases copy the headers CLIProxyAPI stored for two accounts on 3 Nov 2026.
-func TestScheduleFromHeaders(t *testing.T) {
-	at := time.Date(2026, 11, 3, 2, 39, 0, 0, time.UTC)
-	fiveReset := time.Unix(1793689200, 0).UTC() // 3 Nov 07:00
-	weekReset := time.Unix(1793880000, 0).UTC() // 5 Nov 12:00
+func TestDeferForCooldown(t *testing.T) {
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
 	cases := []struct {
-		name     string
-		headers  http.Header
-		wantMode Mode
-		want     time.Time
+		name       string
+		next       time.Time
+		retryAfter time.Time
+		want       time.Time
+		wait       bool
 	}{
-		// Rolling.
-		{"rolling", http.Header{
-			"Anthropic-Ratelimit-Unified-5h-Reset":       {unix(fiveReset)},
-			"Anthropic-Ratelimit-Unified-5h-Status":      {"allowed"},
-			"Anthropic-Ratelimit-Unified-7d-Reset":       {unix(weekReset)},
-			"Anthropic-Ratelimit-Unified-7d-Status":      {"allowed"},
-			"Anthropic-Ratelimit-Unified-7d-Utilization": {"0.42"},
-		}, ModeRolling, fiveReset.Add(time.Minute)},
-		{"rolling with a weekly warning", http.Header{
-			"Anthropic-Ratelimit-Unified-5h-Reset":       {unix(fiveReset)},
-			"Anthropic-Ratelimit-Unified-7d-Status":      {"allowed_warning"},
-			"Anthropic-Ratelimit-Unified-7d-Utilization": {"0.99"},
-		}, ModeRolling, fiveReset.Add(time.Minute)},
-		{"rolling without weekly headers", http.Header{
-			"Anthropic-Ratelimit-Unified-5h-Reset": {unix(fiveReset)},
-		}, ModeRolling, fiveReset.Add(time.Minute)},
-		{"no headers", nil, ModeRolling, at.Add(5*time.Hour + time.Minute)},
-		{"garbled five-hour reset", http.Header{
-			"Anthropic-Ratelimit-Unified-5h-Reset":  {"soon"},
-			"Anthropic-Ratelimit-Unified-5h-Status": {"allowed"},
-			"Anthropic-Ratelimit-Unified-7d-Reset":  {unix(weekReset)},
-		}, ModeRolling, at.Add(5*time.Hour + time.Minute)},
-		{"five-hour reset at the limit ahead", http.Header{
-			"Anthropic-Ratelimit-Unified-5h-Reset": {unix(at.Add(6 * time.Hour))},
-		}, ModeRolling, at.Add(6*time.Hour + time.Minute)},
-		{"five-hour reset too far ahead", http.Header{
-			"Anthropic-Ratelimit-Unified-5h-Reset": {unix(at.Add(6*time.Hour + time.Second))},
-		}, ModeRolling, at.Add(5*time.Hour + time.Minute)},
-		{"garbled weekly utilization", http.Header{
-			"Anthropic-Ratelimit-Unified-5h-Reset":       {unix(fiveReset)},
-			"Anthropic-Ratelimit-Unified-7d-Status":      {"allowed"},
-			"Anthropic-Ratelimit-Unified-7d-Utilization": {"full"},
-		}, ModeRolling, fiveReset.Add(time.Minute)},
-		{"model-scoped weekly limit reached", http.Header{
-			"Anthropic-Ratelimit-Unified-5h-Reset":          {unix(fiveReset)},
-			"Anthropic-Ratelimit-Unified-7d-Reset":          {unix(weekReset)},
-			"Anthropic-Ratelimit-Unified-7d-Status":         {"allowed"},
-			"Anthropic-Ratelimit-Unified-7d-Utilization":    {"0.40"},
-			"Anthropic-Ratelimit-Unified-7d_oi-Reset":       {unix(at.Add(time.Hour))},
-			"Anthropic-Ratelimit-Unified-7d_oi-Status":      {"rejected"},
-			"Anthropic-Ratelimit-Unified-7d_oi-Utilization": {"1.02"},
-			"Anthropic-Ratelimit-Unified-Status":            {"rejected"},
-		}, ModeRolling, fiveReset.Add(time.Minute)},
-		{"only model-scoped headers", http.Header{
-			"Anthropic-Ratelimit-Unified-7d_oi-Reset":  {unix(weekReset)},
-			"Anthropic-Ratelimit-Unified-7d_oi-Status": {"rejected"},
-		}, ModeRolling, at.Add(5*time.Hour + time.Minute)},
-
-		// No five-hour limit.
-		{"weekly only (live f2a3f5069de30215)", http.Header{
-			"Anthropic-Ratelimit-Unified-7d-Reset":                {"1794272400"},
-			"Anthropic-Ratelimit-Unified-7d-Status":               {"allowed"},
-			"Anthropic-Ratelimit-Unified-7d-Utilization":          {"0.01"},
-			"Anthropic-Ratelimit-Unified-Fallback-Percentage":     {"0.5"},
-			"Anthropic-Ratelimit-Unified-Overage-Disabled-Reason": {"org_level_disabled"},
-			"Anthropic-Ratelimit-Unified-Overage-Status":          {"rejected"},
-			"Anthropic-Ratelimit-Unified-Representative-Claim":    {"seven_day"},
-			"Anthropic-Ratelimit-Unified-Reset":                   {"1794272400"},
-			"Anthropic-Ratelimit-Unified-Status":                  {"allowed"},
-		}, ModeNoFiveHour, time.Unix(1794272400, 0).UTC().Add(time.Minute)},
-		{"weekly only without a weekly reset", http.Header{
-			"Anthropic-Ratelimit-Unified-7d-Status":      {"allowed"},
-			"Anthropic-Ratelimit-Unified-7d-Utilization": {"0.01"},
-		}, ModeNoFiveHour, at.Add(24 * time.Hour)},
-		{"weekly only with a garbled weekly reset", http.Header{
-			"Anthropic-Ratelimit-Unified-7d-Reset":  {"next tuesday"},
-			"Anthropic-Ratelimit-Unified-7d-Status": {"allowed"},
-		}, ModeNoFiveHour, at.Add(24 * time.Hour)},
-		{"weekly only with a reset at the limit ahead", http.Header{
-			"Anthropic-Ratelimit-Unified-7d-Reset": {unix(at.Add(7*24*time.Hour + time.Hour))},
-		}, ModeNoFiveHour, at.Add(7*24*time.Hour + time.Hour + time.Minute)},
-		{"weekly only with a reset too far ahead", http.Header{
-			"Anthropic-Ratelimit-Unified-7d-Reset": {unix(at.Add(7*24*time.Hour + time.Hour + time.Second))},
-		}, ModeNoFiveHour, at.Add(24 * time.Hour)},
-		{"weekly only with blank five-hour headers", http.Header{
-			"Anthropic-Ratelimit-Unified-5h-Reset": {"  "},
-			"Anthropic-Ratelimit-Unified-7d-Reset": {unix(weekReset)},
-		}, ModeNoFiveHour, weekReset.Add(time.Minute)},
-
-		// Weekly limit reached.
-		{"weekly rejected while five-hour allowed (live 8dc6f68dec36dcc4)", http.Header{
-			"Anthropic-Ratelimit-Unified-5h-Reset":                {unix(fiveReset)},
-			"Anthropic-Ratelimit-Unified-5h-Status":               {"allowed"},
-			"Anthropic-Ratelimit-Unified-5h-Utilization":          {"0.01"},
-			"Anthropic-Ratelimit-Unified-7d-Reset":                {unix(weekReset)},
-			"Anthropic-Ratelimit-Unified-7d-Status":               {"rejected"},
-			"Anthropic-Ratelimit-Unified-7d-Surpassed-Threshold":  {"1.0"},
-			"Anthropic-Ratelimit-Unified-7d-Utilization":          {"1.0"},
-			"Anthropic-Ratelimit-Unified-Overage-Disabled-Reason": {"org_level_disabled"},
-			"Anthropic-Ratelimit-Unified-Representative-Claim":    {"seven_day"},
-			"Anthropic-Ratelimit-Unified-Reset":                   {unix(weekReset)},
-			"Anthropic-Ratelimit-Unified-Status":                  {"rejected"},
-		}, ModeWeeklyReached, weekReset.Add(time.Minute)},
-		{"weekly rejected, utilization missing", http.Header{
-			"Anthropic-Ratelimit-Unified-5h-Reset":  {unix(fiveReset)},
-			"Anthropic-Ratelimit-Unified-5h-Status": {"allowed"},
-			"Anthropic-Ratelimit-Unified-7d-Reset":  {unix(weekReset)},
-			"Anthropic-Ratelimit-Unified-7d-Status": {"Rejected"},
-		}, ModeWeeklyReached, weekReset.Add(time.Minute)},
-		{"weekly utilization at 1 while status allowed", http.Header{
-			"Anthropic-Ratelimit-Unified-5h-Reset":       {unix(fiveReset)},
-			"Anthropic-Ratelimit-Unified-7d-Reset":       {unix(weekReset)},
-			"Anthropic-Ratelimit-Unified-7d-Status":      {"allowed_warning"},
-			"Anthropic-Ratelimit-Unified-7d-Utilization": {"1"},
-		}, ModeWeeklyReached, weekReset.Add(time.Minute)},
-		{"weekly utilization over 1", http.Header{
-			"Anthropic-Ratelimit-Unified-7d-Reset":       {unix(weekReset)},
-			"Anthropic-Ratelimit-Unified-7d-Utilization": {"1.02"},
-		}, ModeWeeklyReached, weekReset.Add(time.Minute)},
-		{"weekly reached without a weekly reset", http.Header{
-			"Anthropic-Ratelimit-Unified-5h-Reset":  {unix(fiveReset)},
-			"Anthropic-Ratelimit-Unified-7d-Status": {"rejected"},
-		}, ModeWeeklyReached, at.Add(24 * time.Hour)},
-
-		// Clock skew on the weekly reset, as for the five-hour reset.
-		{"weekly reset just passed (fast clock)", http.Header{
-			"Anthropic-Ratelimit-Unified-7d-Reset":  {unix(at.Add(-30 * time.Second))},
-			"Anthropic-Ratelimit-Unified-7d-Status": {"allowed"},
-		}, ModeNoFiveHour, at.Add(2 * time.Minute)},
-		{"weekly reset exactly now while rejected", http.Header{
-			"Anthropic-Ratelimit-Unified-5h-Reset":  {unix(fiveReset)},
-			"Anthropic-Ratelimit-Unified-7d-Reset":  {unix(at)},
-			"Anthropic-Ratelimit-Unified-7d-Status": {"rejected"},
-		}, ModeWeeklyReached, at.Add(2 * time.Minute)},
-		{"weekly reset at skew tolerance", http.Header{
-			"Anthropic-Ratelimit-Unified-7d-Reset":  {unix(at.Add(-10 * time.Minute))},
-			"Anthropic-Ratelimit-Unified-7d-Status": {"rejected"},
-		}, ModeWeeklyReached, at.Add(2 * time.Minute)},
-		{"weekly reset long past", http.Header{
-			"Anthropic-Ratelimit-Unified-7d-Reset":  {unix(at.Add(-11 * time.Minute))},
-			"Anthropic-Ratelimit-Unified-7d-Status": {"rejected"},
-		}, ModeWeeklyReached, at.Add(24 * time.Hour)},
-		{"five-hour reset just passed with weekly headers", http.Header{
-			"Anthropic-Ratelimit-Unified-5h-Reset":  {unix(at.Add(-time.Minute))},
-			"Anthropic-Ratelimit-Unified-7d-Reset":  {unix(weekReset)},
-			"Anthropic-Ratelimit-Unified-7d-Status": {"allowed"},
-		}, ModeRolling, at.Add(2 * time.Minute)},
-
-		// Header names in any letter case.
-		{"lowercase names", http.Header{
-			"anthropic-ratelimit-unified-7d-reset":  {unix(weekReset)},
-			"anthropic-ratelimit-unified-7d-status": {"rejected"},
-		}, ModeWeeklyReached, weekReset.Add(time.Minute)},
-		{"uppercase names", http.Header{
-			"ANTHROPIC-RATELIMIT-UNIFIED-7D-RESET":       {unix(weekReset)},
-			"ANTHROPIC-RATELIMIT-UNIFIED-7D-UTILIZATION": {"0.3"},
-		}, ModeNoFiveHour, weekReset.Add(time.Minute)},
-		{"mixed-case names", http.Header{
-			"Anthropic-RateLimit-Unified-5H-Reset": {unix(fiveReset)},
-			"anthropic-Ratelimit-unified-7d-Reset": {unix(weekReset)},
-		}, ModeRolling, fiveReset.Add(time.Minute)},
+		{"no cooldown", now, time.Time{}, now, false},
+		{"cooldown over", now, now.Add(-time.Second), now, false},
+		{"cooldown at now is over", now, now, now, false},
+		{"active cooldown", now, now.Add(time.Hour), now.Add(time.Hour + ResetBuffer), true},
+		{"next already later", now.Add(2 * time.Hour), now.Add(time.Hour), now.Add(2 * time.Hour), true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			limits := ParseLimits(tc.headers)
-			if mode := limits.Mode(); mode != tc.wantMode {
-				t.Fatalf("Mode = %q, want %q (limits %+v)", mode, tc.wantMode, limits)
-			}
-			if got := NextPing(Outcome{At: at, OK: true, Limits: limits}); !got.Equal(tc.want) {
-				t.Fatalf("NextPing = %s, want %s", got, tc.want)
+			got, wait := DeferForCooldown(now, tc.next, tc.retryAfter)
+			if !got.Equal(tc.want) || wait != tc.wait {
+				t.Fatalf("DeferForCooldown = %s, %v; want %s, %v", got, wait, tc.want, tc.wait)
 			}
 		})
 	}
 }
 
-// A failed reply carries no headers, so the failure path decides the next ping.
-// A failed manual ping leaves an account that waits for its weekly reset alone.
-func TestNextPingAfterFailureByMode(t *testing.T) {
-	at := time.Date(2026, 11, 3, 2, 39, 0, 0, time.UTC)
-	scheduled := time.Date(2026, 11, 7, 1, 1, 0, 0, time.UTC)
-	cooldown := time.Date(2026, 11, 5, 12, 0, 10, 0, time.UTC)
+func TestCooldownDecision(t *testing.T) {
+	reset := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	base := CooldownCheck{Now: reset.Add(30 * time.Second), Enabled: true, Reset: reset, NextRetryAfter: reset.Add(time.Hour)}
+	with := func(change func(*CooldownCheck)) CooldownCheck {
+		c := base
+		change(&c)
+		return c
+	}
 	cases := []struct {
-		name    string
-		outcome Outcome
-		want    time.Time
+		name          string
+		check         CooldownCheck
+		decide, clear bool
 	}{
-		{"weekly re-check fails", Outcome{At: at, Mode: ModeNoFiveHour, Scheduled: at}, at.Add(15 * time.Minute)},
-		{"weekly-reached ping fails with a weekly cooldown", Outcome{At: at, Mode: ModeWeeklyReached, CooldownUntil: cooldown, Scheduled: at}, cooldown.Add(time.Minute)},
-		{"failed manual ping keeps the weekly re-check", Outcome{At: at, Mode: ModeNoFiveHour, Manual: true, Scheduled: scheduled}, scheduled},
-		{"failed manual ping keeps the weekly resume", Outcome{At: at, Mode: ModeWeeklyReached, Manual: true, Scheduled: scheduled}, scheduled},
-		{"failed manual ping keeps the weekly resume over a cooldown", Outcome{At: at, Mode: ModeWeeklyReached, Manual: true, Scheduled: scheduled, CooldownUntil: cooldown}, scheduled},
-		{"failed manual ping without a schedule", Outcome{At: at, Mode: ModeWeeklyReached, Manual: true}, at.Add(15 * time.Minute)},
-		{"failed manual ping on a rolling account retries", Outcome{At: at, Mode: ModeRolling, Manual: true, Scheduled: scheduled}, at.Add(15 * time.Minute)},
-		{"failed manual ping before any success retries", Outcome{At: at, Manual: true, Scheduled: scheduled}, at.Add(15 * time.Minute)},
+		{"active cooldown after reset", base, true, true},
+		{"unavailable flag only", with(func(c *CooldownCheck) { c.NextRetryAfter = time.Time{}; c.Unavailable = true }), true, true},
+		{"no cooldown: decide, do not clear", with(func(c *CooldownCheck) { c.NextRetryAfter = time.Time{} }), true, false},
+		{"cooldown already over", with(func(c *CooldownCheck) { c.NextRetryAfter = c.Now.Add(-time.Second) }), true, false},
+		{"disabled setting", with(func(c *CooldownCheck) { c.Enabled = false }), false, false},
+		{"reset unknown", with(func(c *CooldownCheck) { c.Reset = time.Time{} }), false, false},
+		{"reset not passed yet", with(func(c *CooldownCheck) { c.Now = reset.Add(-time.Second) }), false, false},
+		{"reset exactly now", with(func(c *CooldownCheck) { c.Now = reset }), true, true},
+		{"reset too long ago", with(func(c *CooldownCheck) { c.Now = reset.Add(CooldownResetWindow + time.Second) }), false, false},
+		{"already decided for this reset", with(func(c *CooldownCheck) { c.DoneFor = reset }), false, false},
+		{"decided for an older reset", with(func(c *CooldownCheck) { c.DoneFor = reset.Add(-provider.Week) }), true, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := NextPing(tc.outcome); !got.Equal(tc.want) {
-				t.Fatalf("NextPing = %s, want %s", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestParseLimits(t *testing.T) {
-	reset := time.Unix(1790000000, 0).UTC()
-	util := func(v float64) *float64 { return &v }
-	cases := []struct {
-		name    string
-		headers http.Header
-		want    Limits
-	}{
-		{"canonical unix", http.Header{"Anthropic-Ratelimit-Unified-5h-Reset": {"1790000000"}}, fiveHour(reset)},
-		{"lowercase key and padded value", http.Header{"anthropic-ratelimit-unified-5h-reset": {" 1790000000 "}}, fiveHour(reset)},
-		{"rfc3339", http.Header{"Anthropic-Ratelimit-Unified-5h-Reset": {reset.Format(time.RFC3339)}}, fiveHour(reset)},
-		{"garbage reset", http.Header{"Anthropic-Ratelimit-Unified-5h-Reset": {"soon"}}, Limits{FiveHour: true}},
-		{"zero reset", http.Header{"Anthropic-Ratelimit-Unified-5h-Reset": {"0"}}, Limits{FiveHour: true}},
-		{"negative reset", http.Header{"Anthropic-Ratelimit-Unified-7d-Reset": {"-5"}}, Limits{Weekly: true}},
-		{"first of repeated values", http.Header{"Anthropic-Ratelimit-Unified-7d-Reset": {"1790000000", "1"}}, Limits{Weekly: true, WeeklyReset: reset}},
-		{"empty value list", http.Header{"Anthropic-Ratelimit-Unified-5h-Reset": {}}, Limits{}},
-		{"weekly fields", http.Header{
-			"Anthropic-Ratelimit-Unified-7d-Reset":       {"1790000000"},
-			"Anthropic-Ratelimit-Unified-7d-Status":      {"REJECTED"},
-			"Anthropic-Ratelimit-Unified-7d-Utilization": {"0.75"},
-		}, Limits{Weekly: true, WeeklyReset: reset, WeeklyRejected: true, WeeklyUtilization: util(0.75)}},
-		{"garbled utilization", http.Header{"Anthropic-Ratelimit-Unified-7d-Utilization": {"75%"}}, Limits{Weekly: true}},
-		{"negative utilization", http.Header{"Anthropic-Ratelimit-Unified-7d-Utilization": {"-0.1"}}, Limits{Weekly: true}},
-		{"NaN utilization", http.Header{"Anthropic-Ratelimit-Unified-7d-Utilization": {"NaN"}}, Limits{Weekly: true}},
-		{"infinite utilization", http.Header{"Anthropic-Ratelimit-Unified-7d-Utilization": {"+Inf"}}, Limits{Weekly: true}},
-		{"unknown status", http.Header{"Anthropic-Ratelimit-Unified-7d-Status": {"invalid"}}, Limits{Weekly: true}},
-		{"model-scoped and overall headers ignored", http.Header{
-			"Anthropic-Ratelimit-Unified-7d_oi-Status":      {"rejected"},
-			"Anthropic-Ratelimit-Unified-7d_oi-Utilization": {"1.02"},
-			"Anthropic-Ratelimit-Unified-Status":            {"rejected"},
-			"Anthropic-Ratelimit-Unified-Reset":             {"1790000000"},
-			"Retry-After":                                   {"60"},
-		}, Limits{}},
-		{"nil", nil, Limits{}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := ParseLimits(tc.headers)
-			if got.FiveHour != tc.want.FiveHour || got.Weekly != tc.want.Weekly ||
-				!got.FiveHourReset.Equal(tc.want.FiveHourReset) || !got.WeeklyReset.Equal(tc.want.WeeklyReset) ||
-				got.WeeklyRejected != tc.want.WeeklyRejected {
-				t.Fatalf("ParseLimits = %+v, want %+v", got, tc.want)
-			}
-			switch {
-			case (got.WeeklyUtilization == nil) != (tc.want.WeeklyUtilization == nil):
-				t.Fatalf("WeeklyUtilization = %v, want %v", got.WeeklyUtilization, tc.want.WeeklyUtilization)
-			case got.WeeklyUtilization != nil && *got.WeeklyUtilization != *tc.want.WeeklyUtilization:
-				t.Fatalf("WeeklyUtilization = %v, want %v", *got.WeeklyUtilization, *tc.want.WeeklyUtilization)
+			decide, clear := CooldownDecision(tc.check)
+			if decide != tc.decide || clear != tc.clear {
+				t.Fatalf("CooldownDecision = %v, %v; want %v, %v", decide, clear, tc.decide, tc.clear)
 			}
 		})
 	}
@@ -401,15 +336,15 @@ func TestPluginEnabled(t *testing.T) {
 		raw  string
 		want bool
 	}{
-		{"enabled", "plugins:\n  enabled: true\n  configs:\n    claude-keep-rolling:\n      enabled: true\n", true},
-		{"plugin disabled", "plugins:\n  enabled: true\n  configs:\n    claude-keep-rolling:\n      enabled: false\n", false},
-		{"plugins disabled", "plugins:\n  enabled: false\n  configs:\n    claude-keep-rolling:\n      enabled: true\n", false},
-		{"not configured", "plugins:\n  enabled: true\n  configs:\n    other:\n      enabled: true\n", false},
+		{"enabled", "plugins:\n  enabled: true\n  configs:\n    keep-rolling:\n      enabled: true\n", true},
+		{"plugin disabled", "plugins:\n  enabled: true\n  configs:\n    keep-rolling:\n      enabled: false\n", false},
+		{"plugins disabled", "plugins:\n  enabled: false\n  configs:\n    keep-rolling:\n      enabled: true\n", false},
+		{"only the old plugin configured", "plugins:\n  enabled: true\n  configs:\n    claude-keep-rolling:\n      enabled: true\n", false},
 		{"no plugins section", "port: 8317\n", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := PluginEnabled([]byte(tc.raw), "claude-keep-rolling")
+			got, err := PluginEnabled([]byte(tc.raw), "keep-rolling")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -418,7 +353,7 @@ func TestPluginEnabled(t *testing.T) {
 			}
 		})
 	}
-	if _, err := PluginEnabled([]byte("plugins: [unclosed"), "claude-keep-rolling"); err == nil {
+	if _, err := PluginEnabled([]byte("plugins: [unclosed"), "keep-rolling"); err == nil {
 		t.Fatal("expected a parse error")
 	}
 }

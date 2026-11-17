@@ -3,7 +3,7 @@
 # registers with VERSION, serves its page, and keeps its data behind the
 # management key. CPA_VERSION is the CLIProxyAPI release to test against, and
 # CPA_ASSET is its release asset suffix for the runner.
-#   VERSION=0.1.0 CPA_VERSION=8.0.10 CPA_ASSET=linux_amd64.tar.gz ./scripts/smoke-test.sh dist/claude-keep-rolling_0.1.0_linux_amd64.zip
+#   VERSION=0.1.0 CPA_VERSION=8.0.10 CPA_ASSET=linux_amd64.tar.gz ./scripts/smoke-test.sh dist/keep-rolling_0.1.0_linux_amd64.zip
 set -euo pipefail
 
 zip=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
@@ -41,7 +41,7 @@ plugins:
   enabled: true
   dir: "plugins"
   configs:
-    claude-keep-rolling:
+    keep-rolling:
       enabled: true
 EOF
 
@@ -62,7 +62,7 @@ fail() {
 
 state=""
 for _ in $(seq 60); do
-	state=$(curl -sf -H "Authorization: Bearer $key" "$base/v0/management/claude-keep-rolling/state" || true)
+	state=$(curl -sf -H "Authorization: Bearer $key" "$base/v0/management/keep-rolling/state" || true)
 	[[ -n "$state" ]] && break
 	kill -0 "$pid" 2>/dev/null || fail "CLIProxyAPI exited"
 	sleep 1
@@ -71,10 +71,10 @@ done
 grep -q "\"version\":\"$VERSION\"" <<<"$state" || fail "state does not report version $VERSION: $state"
 echo "ok: plugin registered and reports version $VERSION"
 
-curl -sf "$base/v0/resource/plugins/claude-keep-rolling/status" | grep -q '<select id="model">' || fail "status page not served"
+curl -sf "$base/v0/resource/plugins/keep-rolling/status" | grep -q '<div id="providers">' || fail "status page not served"
 echo "ok: status page served"
 
-code=$(curl -s -o /dev/null -w '%{http_code}' "$base/v0/management/claude-keep-rolling/state")
+code=$(curl -s -o /dev/null -w '%{http_code}' "$base/v0/management/keep-rolling/state")
 [[ "$code" == 401 ]] || fail "state route answered $code without the management key"
 echo "ok: state route requires the management key"
 
@@ -84,7 +84,7 @@ if rss=$(ps -o rss= -p "$pid" 2>/dev/null) && [[ -n "${rss// /}" ]]; then
 	calls=2000
 	before=${rss// /}
 	for _ in $(seq "$calls"); do
-		curl -sf -o /dev/null -H "Authorization: Bearer $key" "$base/v0/management/claude-keep-rolling/state" || fail "state call failed during leak check"
+		curl -sf -o /dev/null -H "Authorization: Bearer $key" "$base/v0/management/keep-rolling/state" || fail "state call failed during leak check"
 	done
 	kill -0 "$pid" 2>/dev/null || fail "CLIProxyAPI exited during leak check"
 	after=$(ps -o rss= -p "$pid" | tr -d ' ')

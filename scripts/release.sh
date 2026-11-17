@@ -10,7 +10,7 @@
 # checksums.txt covers the zips built by this run.
 set -euo pipefail
 
-id=claude-keep-rolling
+id=keep-rolling
 version=${VERSION:-}
 if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 	echo "VERSION must be a dotted numeric version such as 0.1.0, got '$version'" >&2

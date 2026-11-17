@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"sort"
 	"strings"
@@ -11,7 +12,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/265866/claude-keep-rolling/internal/rolling"
+	"github.com/bogorad/claude-keep-rolling/internal/provider"
+	"github.com/bogorad/claude-keep-rolling/internal/rolling"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -22,22 +24,25 @@ const (
 	tickInterval = 30 * time.Second
 	// shutdownWait bounds how long shutdown waits for in-flight pings.
 	shutdownWait = time.Minute
-	// pingMaxTokens keeps the reply tiny. A ping only needs to reach Anthropic to start the window.
-	pingMaxTokens = 1
 )
 
 var keeper = newRoller()
 
 type accountState struct {
+	Provider   string
 	LastPingAt time.Time
 	LastOK     bool
 	LastStatus int
 	LastError  string
-	// Limits and Mode come from the last successful ping.
-	Limits     rolling.Limits
-	Mode       rolling.Mode
-	NextPingAt time.Time
-	Pinging    bool
+	// Weekly comes from the last successful ping.
+	Weekly provider.Weekly
+	// LastResetSeen is the most recent weekly reset the plugin saw pass.
+	LastResetSeen time.Time
+	// CooldownResetFor is the reset for which the plugin cleared a cooldown.
+	CooldownResetFor time.Time
+	CooldownResetAt  time.Time
+	NextPingAt       time.Time
+	Pinging          bool
 }
 
 type roller struct {
@@ -46,6 +51,10 @@ type roller struct {
 	configError string
 	states      map[string]*accountState
 	stopCh      chan struct{}
+	// lastSlot is the last first-ping slot handed out after a start.
+	lastSlot time.Time
+	// random returns a number in [0, 1). Tests replace it.
+	random func() float64
 	// background tracks the loop and its pings so shutdown can wait for host calls to finish.
 	background sync.WaitGroup
 	// configWarned records that an unreadable host config was already logged.
@@ -54,7 +63,7 @@ type roller struct {
 
 func newRoller() *roller {
 	settings, _ := rolling.ParseSettings(nil)
-	return &roller{settings: settings, states: map[string]*accountState{}}
+	return &roller{settings: settings, states: map[string]*accountState{}, random: rand.Float64}
 }
 
 // configure applies new settings. Invalid settings keep the previous ones and are reported on the status page.
@@ -83,6 +92,7 @@ func (r *roller) start() {
 	}
 	stop := make(chan struct{})
 	r.stopCh = stop
+	r.lastSlot = time.Time{}
 	r.background.Add(1)
 	go func() {
 		defer r.background.Done()
@@ -127,22 +137,32 @@ func (r *roller) run(stop <-chan struct{}) {
 	}
 }
 
-// tick starts a ping for every selected, enabled Claude account whose next ping is due.
-// Pings run concurrently so one slow account does not hold up the others.
+// tracked is a host account with its adapter.
+type tracked struct {
+	entry   pluginapi.HostAuthFileEntry
+	adapter provider.Adapter
+}
+
+// tick clears cooldowns that a weekly reset made stale, then starts a ping
+// for every due account. Pings run concurrently so one slow account does not
+// hold up the others.
 func (r *roller) tick(stop <-chan struct{}, now time.Time) {
 	if !r.hostEnablesPlugin() {
 		return
 	}
-	accounts, err := listClaudeAccounts()
+	accounts, err := listAccounts()
 	if err != nil {
-		hostLog("warn", "listing Claude accounts failed", map[string]any{"error": err.Error()})
+		hostLog("warn", "listing accounts failed", map[string]any{"error": err.Error()})
 		return
 	}
 	settings, _ := r.currentSettings()
+	for _, account := range r.cooldownsToReset(accounts, settings, now) {
+		r.resetCooldown(account, now)
+	}
 	for _, account := range r.claimDue(accounts, settings, now) {
 		select {
 		case <-stop:
-			r.release(account.ID)
+			r.release(account.entry.ID)
 			continue
 		default:
 		}
@@ -177,19 +197,105 @@ func (r *roller) hostEnablesPlugin() bool {
 	return enabled
 }
 
-// claimDue drops state for accounts that no longer exist and marks due accounts as pinging.
-func (r *roller) claimDue(accounts []pluginapi.HostAuthFileEntry, settings rolling.Settings, now time.Time) []pluginapi.HostAuthFileEntry {
+// active reports whether the plugin acts on the account at all.
+func active(account tracked, settings rolling.Settings) bool {
+	p := settings.Provider(account.adapter.ID())
+	return p.Enabled && !account.entry.Disabled && p.Selected(account.entry.ID)
+}
+
+// knownReset returns the latest weekly reset for the account at or before
+// now: the calendar reset for fixed providers, else the reset from the last
+// successful ping once it has passed. The caller holds r.mu.
+func knownReset(account tracked, state *accountState, now time.Time) time.Time {
+	if fixed := account.adapter.FixedReset(now); !fixed.IsZero() {
+		return fixed
+	}
+	if reset := state.Weekly.Reset; !reset.IsZero() && !now.Before(reset) {
+		return reset
+	}
+	return state.LastResetSeen
+}
+
+// cooldownsToReset records passed resets and returns the accounts whose
+// cooldown should be cleared now. It marks them done before the host call,
+// so a reset is attempted at most once.
+func (r *roller) cooldownsToReset(accounts []tracked, settings rolling.Settings, now time.Time) []tracked {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var due []tracked
+	for _, account := range accounts {
+		if !active(account, settings) {
+			continue
+		}
+		state := r.stateLocked(account)
+		reset := knownReset(account, state, now)
+		if !reset.IsZero() && reset.After(state.LastResetSeen) {
+			state.LastResetSeen = reset
+		}
+		decide, clear := rolling.CooldownDecision(rolling.CooldownCheck{
+			Now:            now,
+			Enabled:        settings.CooldownReset,
+			Reset:          reset,
+			DoneFor:        state.CooldownResetFor,
+			Unavailable:    account.entry.Unavailable,
+			NextRetryAfter: account.entry.NextRetryAfter,
+		})
+		if !decide {
+			continue
+		}
+		state.CooldownResetFor = reset
+		if clear {
+			due = append(due, account)
+		}
+	}
+	return due
+}
+
+func (r *roller) resetCooldown(account tracked, now time.Time) {
+	fields := map[string]any{"account": accountName(account.entry), "provider": account.adapter.ID()}
+	if strings.TrimSpace(account.entry.AuthIndex) == "" {
+		fields["error"] = "account has no auth_index"
+		hostLog("warn", "cooldown reset skipped", fields)
+		return
+	}
+	_, err := callHost(pluginabi.MethodHostRoutingResetCooldown, pluginapi.HostRoutingResetCooldownRequest{AuthIndex: account.entry.AuthIndex})
+	if err != nil {
+		fields["error"] = err.Error()
+		hostLog("warn", "cooldown reset after weekly reset failed", fields)
+		return
+	}
+	r.mu.Lock()
+	r.stateLocked(account).CooldownResetAt = now
+	r.mu.Unlock()
+	hostLog("info", "cooldown reset after weekly reset", fields)
+}
+
+// claimDue drops state for accounts that no longer exist, gives new accounts a
+// staggered first ping, and marks due accounts as pinging.
+func (r *roller) claimDue(accounts []tracked, settings rolling.Settings, now time.Time) []tracked {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	present := make(map[string]bool, len(accounts))
-	var due []pluginapi.HostAuthFileEntry
+	var due []tracked
 	for _, account := range accounts {
-		present[account.ID] = true
-		if account.Disabled || !settings.Selected(account.ID) {
+		present[account.entry.ID] = true
+		if !active(account, settings) || !provider.CanPing(account.adapter) {
 			continue
 		}
-		state := r.stateLocked(account.ID)
-		if state.Pinging || now.Before(state.NextPingAt) {
+		state := r.stateLocked(account)
+		if state.Pinging {
+			continue
+		}
+		if state.NextPingAt.IsZero() {
+			slot := rolling.NextSlot(now, r.lastSlot, time.Duration(settings.Stagger), r.random())
+			r.lastSlot = slot
+			state.NextPingAt = slot
+		}
+		if now.Before(state.NextPingAt) {
+			continue
+		}
+		if next, wait := rolling.DeferForCooldown(now, state.NextPingAt, account.entry.NextRetryAfter); wait {
+			state.NextPingAt = next
 			continue
 		}
 		state.Pinging = true
@@ -204,10 +310,10 @@ func (r *roller) claimDue(accounts []pluginapi.HostAuthFileEntry, settings rolli
 }
 
 // claim marks one account as pinging for a manual ping. It fails if a ping is already running.
-func (r *roller) claim(accountID string) bool {
+func (r *roller) claim(account tracked) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state := r.stateLocked(accountID)
+	state := r.stateLocked(account)
 	if state.Pinging {
 		return false
 	}
@@ -218,7 +324,9 @@ func (r *roller) claim(accountID string) bool {
 func (r *roller) release(accountID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.stateLocked(accountID).Pinging = false
+	if state, ok := r.states[accountID]; ok {
+		state.Pinging = false
+	}
 }
 
 func (r *roller) snapshot(accountID string) (accountState, bool) {
@@ -231,29 +339,30 @@ func (r *roller) snapshot(accountID string) (accountState, bool) {
 	return *state, true
 }
 
-func (r *roller) stateLocked(accountID string) *accountState {
-	state, ok := r.states[accountID]
+func (r *roller) stateLocked(account tracked) *accountState {
+	state, ok := r.states[account.entry.ID]
 	if !ok {
-		state = &accountState{}
-		r.states[accountID] = state
+		state = &accountState{Provider: account.adapter.ID()}
+		r.states[account.entry.ID] = state
 	}
 	return state
 }
 
-// ping sends one message through the exact account and records when to ping it next.
-// The caller must have claimed the account.
-func (r *roller) ping(account pluginapi.HostAuthFileEntry, settings rolling.Settings, manual bool) {
+// ping sends one minimal request through the exact account and records when
+// to ping it next. The caller must have claimed the account.
+func (r *roller) ping(account tracked, settings rolling.Settings, manual bool) {
 	at := time.Now()
-	limits, status, err := sendPing(account.ID, settings)
-	outcome := rolling.Outcome{At: at, OK: err == nil, Limits: limits, Manual: manual}
+	p := settings.Provider(account.adapter.ID())
+	weekly, status, err := sendPing(account, p.Model, settings.Prompt, at)
+	delay := rolling.Jitter(time.Duration(settings.DelayMin), time.Duration(settings.DelayMax), r.randomLocked())
+	outcome := rolling.Outcome{At: at, OK: err == nil, Weekly: weekly, Delay: delay, Manual: manual}
 	if err != nil {
-		outcome.CooldownUntil = cooldownUntil(account.ID)
+		outcome.CooldownUntil = cooldownUntil(account.entry.ID)
 	}
 
 	r.mu.Lock()
-	state := r.stateLocked(account.ID)
+	state := r.stateLocked(account)
 	outcome.Scheduled = state.NextPingAt
-	outcome.Mode = state.Mode
 	next := rolling.NextPing(outcome)
 	state.Pinging = false
 	state.LastPingAt = at
@@ -263,98 +372,89 @@ func (r *roller) ping(account pluginapi.HostAuthFileEntry, settings rolling.Sett
 	if err != nil {
 		state.LastError = err.Error()
 	} else {
-		state.Limits = limits
-		state.Mode = limits.Mode()
+		if old := state.Weekly.Reset; !old.IsZero() && !at.Before(old) && old.After(state.LastResetSeen) {
+			state.LastResetSeen = old
+		}
+		state.Weekly = weekly
 	}
 	state.NextPingAt = next
 	r.mu.Unlock()
 
-	fields := map[string]any{"account": accountName(account), "next_ping": next.Format(time.RFC3339)}
+	fields := map[string]any{"account": accountName(account.entry), "provider": account.adapter.ID(), "next_ping": next.Format(time.RFC3339)}
 	if err != nil {
 		fields["error"] = err.Error()
-		hostLog("warn", "Claude keep-rolling ping failed", fields)
+		hostLog("warn", "keep-rolling ping failed", fields)
 		return
 	}
-	fields["mode"] = string(limits.Mode())
-	if !limits.FiveHourReset.IsZero() {
-		fields["window_reset"] = limits.FiveHourReset.Format(time.RFC3339)
+	if !weekly.Reset.IsZero() {
+		fields["weekly_reset"] = weekly.Reset.Format(time.RFC3339)
 	}
-	if !limits.WeeklyReset.IsZero() {
-		fields["weekly_reset"] = limits.WeeklyReset.Format(time.RFC3339)
-	}
-	hostLog("info", "Claude keep-rolling ping sent", fields)
+	hostLog("info", "keep-rolling ping sent", fields)
 }
 
-// cooldownUntil returns the retry time the host recorded for the account after a failure,
-// which for a rate limit is the window reset parsed from the rejected response.
+// randomLocked draws a random number under the lock, because tests swap r.random.
+func (r *roller) randomLocked() float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.random()
+}
+
+// cooldownUntil returns the retry time the host recorded for the account after a failure.
 func cooldownUntil(accountID string) time.Time {
-	accounts, err := listClaudeAccounts()
+	accounts, err := listAccounts()
 	if err != nil {
 		return time.Time{}
 	}
 	for _, account := range accounts {
-		if account.ID == accountID {
-			return account.NextRetryAfter
+		if account.entry.ID == accountID {
+			return account.entry.NextRetryAfter
 		}
 	}
 	return time.Time{}
 }
 
-type claudeMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type claudeRequest struct {
-	Model     string          `json:"model"`
-	MaxTokens int             `json:"max_tokens"`
-	Messages  []claudeMessage `json:"messages"`
-}
-
-// sendPing returns the rate limits from a successful reply and the HTTP status.
-// The host returns a failed reply as an error without its headers. No tools are declared,
-// so the model can only answer with text. No host callback ID is passed, so a
-// manual ping is not cancelled when its browser request goes away.
-func sendPing(accountID string, settings rolling.Settings) (rolling.Limits, int, error) {
-	body, err := json.Marshal(claudeRequest{
-		Model:     settings.Model,
-		MaxTokens: pingMaxTokens,
-		Messages:  []claudeMessage{{Role: "user", Content: settings.Prompt}},
-	})
+// sendPing returns the weekly window from a successful reply and the HTTP status.
+// The host returns a failed reply as an error without its headers. No host
+// callback ID is passed, so a manual ping is not cancelled when its browser
+// request goes away.
+func sendPing(account tracked, model, prompt string, at time.Time) (provider.Weekly, int, error) {
+	req, err := account.adapter.BuildPing(model, prompt)
 	if err != nil {
-		return rolling.Limits{}, 0, err
+		return provider.Weekly{}, 0, err
 	}
 	raw, err := callHost(pluginabi.MethodHostModelExecute, pluginapi.HostModelExecutionRequest{
-		EntryProtocol:  "claude",
-		ExitProtocol:   "claude",
-		Model:          settings.Model,
-		Body:           body,
-		ForcedProvider: "claude",
-		AuthID:         accountID,
+		EntryProtocol:  req.EntryProtocol,
+		ExitProtocol:   req.ExitProtocol,
+		Model:          req.Model,
+		Stream:         false,
+		Body:           req.Body,
+		ForcedProvider: req.ForcedProvider,
+		AuthID:         account.entry.ID,
 	})
 	if err != nil {
 		var hostErr *hostError
 		if errors.As(err, &hostErr) {
-			return rolling.Limits{}, hostErr.Status, err
+			return provider.Weekly{}, hostErr.Status, err
 		}
-		return rolling.Limits{}, 0, err
+		return provider.Weekly{}, 0, err
 	}
 	var resp pluginapi.HostModelExecutionResponse
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		return rolling.Limits{}, 0, fmt.Errorf("decode model response: %w", err)
+		return provider.Weekly{}, 0, fmt.Errorf("decode model response: %w", err)
 	}
 	if resp.StatusCode >= 400 {
-		return rolling.Limits{}, resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(resp.Body), 300))
+		return provider.Weekly{}, resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(resp.Body), 300))
 	}
-	return rolling.ParseLimits(resp.Headers), resp.StatusCode, nil
+	return account.adapter.ParseWeekly(resp.Headers, at), resp.StatusCode, nil
 }
 
 type authListResponse struct {
 	Files []pluginapi.HostAuthFileEntry `json:"files"`
 }
 
-// listClaudeAccounts returns Claude OAuth accounts sorted by display name.
-func listClaudeAccounts() ([]pluginapi.HostAuthFileEntry, error) {
+// listAccounts returns host accounts that some adapter owns, sorted by
+// provider and display name.
+func listAccounts() ([]tracked, error) {
 	raw, err := callHost(pluginabi.MethodHostAuthList, map[string]any{})
 	if err != nil {
 		return nil, err
@@ -363,24 +463,33 @@ func listClaudeAccounts() ([]pluginapi.HostAuthFileEntry, error) {
 	if err := json.Unmarshal(raw, &list); err != nil {
 		return nil, fmt.Errorf("decode auth list: %w", err)
 	}
-	accounts := make([]pluginapi.HostAuthFileEntry, 0, len(list.Files))
-	for _, file := range list.Files {
-		if strings.TrimSpace(file.ID) == "" || !isClaudeOAuth(file) {
-			continue
-		}
-		accounts = append(accounts, file)
-	}
-	sort.Slice(accounts, func(i, j int) bool {
-		return strings.ToLower(accountName(accounts[i])) < strings.ToLower(accountName(accounts[j]))
-	})
-	return accounts, nil
+	return selectAccounts(list.Files), nil
 }
 
-// isClaudeOAuth excludes Claude API-key credentials, which bill per request and have no usage window.
-func isClaudeOAuth(file pluginapi.HostAuthFileEntry) bool {
-	claude := strings.EqualFold(strings.TrimSpace(file.Provider), "claude") || strings.EqualFold(strings.TrimSpace(file.Type), "claude")
-	accountType := strings.TrimSpace(file.AccountType)
-	return claude && (accountType == "" || strings.EqualFold(accountType, "oauth"))
+func selectAccounts(files []pluginapi.HostAuthFileEntry) []tracked {
+	order := map[string]int{}
+	for i, adapter := range provider.All() {
+		order[adapter.ID()] = i
+	}
+	accounts := make([]tracked, 0, len(files))
+	for _, file := range files {
+		if strings.TrimSpace(file.ID) == "" {
+			continue
+		}
+		adapter, ok := provider.ForAccount(file)
+		if !ok {
+			continue
+		}
+		accounts = append(accounts, tracked{entry: file, adapter: adapter})
+	}
+	sort.SliceStable(accounts, func(i, j int) bool {
+		a, b := accounts[i], accounts[j]
+		if a.adapter.ID() != b.adapter.ID() {
+			return order[a.adapter.ID()] < order[b.adapter.ID()]
+		}
+		return strings.ToLower(accountName(a.entry)) < strings.ToLower(accountName(b.entry))
+	})
+	return accounts
 }
 
 func accountName(account pluginapi.HostAuthFileEntry) string {
