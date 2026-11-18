@@ -2,6 +2,7 @@ package rolling
 
 import (
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -366,5 +367,29 @@ func TestPluginEnabled(t *testing.T) {
 	}
 	if _, err := PluginEnabled([]byte("plugins: [unclosed"), "keep-rolling"); err == nil {
 		t.Fatal("expected a parse error")
+	}
+}
+
+func TestValidateNamesTheField(t *testing.T) {
+	base, err := ParseSettings(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]func(*Settings){
+		"delay_min":     func(s *Settings) { s.DelayMin = Duration(30 * time.Second) },
+		"delay_max":     func(s *Settings) { s.DelayMax = Duration(7 * time.Hour) },
+		"stagger":       func(s *Settings) { s.Stagger = Duration(-time.Second) },
+		"meta_interval": func(s *Settings) { s.MetaInterval = Duration(4 * time.Minute) },
+	}
+	for field, change := range cases {
+		s := base
+		change(&s)
+		var fieldErr *FieldError
+		if err := s.Validate(); !errors.As(err, &fieldErr) || fieldErr.Field != field {
+			t.Fatalf("%s: %v", field, err)
+		}
+	}
+	if err := base.Validate(); err != nil {
+		t.Fatal(err)
 	}
 }

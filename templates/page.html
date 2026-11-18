@@ -1,0 +1,88 @@
+{{define "page" -}}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="htmx-config" content='{"selfRequestsOnly":true,"allowScriptTags":false,"historyEnabled":false,"historyCacheSize":0,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"40[13]","swap":true,"error":true,"target":"#app","swapOverride":"textContent"},{"code":"409|422","swap":true},{"code":"[45]..","swap":true,"error":true,"target":"#error","swapOverride":"textContent"}]}'>
+<title>Keep Rolling</title>
+<style>
+:root{color-scheme:light dark;--bg:#fff;--fg:#1d1f24;--muted:#6b7280;--line:#e5e7eb;--panel:#f9fafb;--accent:#c96442;--accent-fg:#fff;--ok:#15803d;--err:#b91c1c}
+@media (prefers-color-scheme:dark){:root{--bg:#17181c;--fg:#e8e9ed;--muted:#9ca3af;--line:#2c2f36;--panel:#1e2026;--ok:#4ade80;--err:#f87171}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1080px;margin:0 auto;padding:24px 20px 48px}
+h1{font-size:20px;margin:0}
+h2{font-size:15px;margin:0}
+.sub{color:var(--muted);margin:4px 0 20px}
+.head{display:flex;align-items:baseline;gap:10px}
+.version{color:var(--muted);font-size:12px}
+section{border:1px solid var(--line);border-radius:10px;margin-bottom:16px;overflow:hidden}
+.bar{display:flex;align-items:center;gap:10px;padding:12px 14px;background:var(--panel);border-bottom:1px solid var(--line)}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:normal;font-size:12px}
+tr:last-child td{border-bottom:0}
+td small{display:block;color:var(--muted);font-size:12px}
+td form{margin:0}
+.tag{font-size:11px;color:var(--muted);border:1px solid var(--line);border-radius:4px;padding:0 5px;margin-left:6px}
+.ok{color:var(--ok)}.err{color:var(--err)}.muted{color:var(--muted)}
+button.small{font:inherit;font-size:12px;padding:3px 10px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg);cursor:pointer}
+button.small:disabled{opacity:.5;cursor:default}
+button.sort{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer;text-align:left}
+button.sort:hover,button.sort:focus-visible{color:var(--fg);text-decoration:underline}
+th[aria-sort=ascending],th[aria-sort=descending]{color:var(--fg)}
+.arrow{margin-left:4px}
+.htmx-request button.small,button.small.htmx-request{opacity:.5}
+input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent)}
+.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;padding:14px}
+label.field{display:grid;gap:4px}
+label.field span{font-size:12px;color:var(--muted)}
+label.field small{font-size:12px;color:var(--muted)}
+label.field small.err{color:var(--err)}
+input[type=text],input[type=password]{font:inherit;padding:6px 8px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg);width:100%}
+input[aria-invalid=true]{border-color:var(--err)}
+.actions{padding:0 14px 14px}
+.empty,.notice{padding:16px 14px;color:var(--muted);margin:0}
+.notice.err{color:var(--err)}
+.notice:empty{display:none}
+#error{margin-bottom:16px;border:1px solid var(--err);border-radius:10px}
+#error:empty{display:none}
+#app{white-space:normal}
+.keybox{display:flex;gap:8px;padding:14px}
+.keybox input{flex:1}
+#key-status{margin-left:auto;font-size:12px;color:var(--muted)}
+</style>
+<script src="{{.HTMXPath}}" integrity="{{.HTMXIntegrity}}"></script>
+<script src="{{.JSONEncPath}}" integrity="{{.JSONEncIntegrity}}"></script>
+<script>
+// The only custom script (docs/ui.md): add the management key, held in the
+// unnamed password field below, to every htmx request.
+document.addEventListener("htmx:configRequest", function (event) {
+  var key = document.getElementById("key").value.trim();
+  if (key) event.detail.headers["X-Management-Key"] = key;
+});
+</script>
+</head>
+<body>
+<main>
+<div class="head"><h1>Keep Rolling</h1><span class="version" id="version"></span></div>
+<p class="sub">Starts each selected account's weekly usage window right after its reset, plus a random delay. Only providers whose weekly window starts on first use are pinged at the reset. Meta is pinged on a fixed interval instead, first at plugin start. At a reset, an active host cooldown for the account can be cleared once.</p>
+
+<section id="key-section">
+<div class="bar"><h2>Management key</h2><span id="key-status"></span></div>
+<p class="notice">Enter the CLIProxyAPI management key. The page keeps it in memory only: reloading the page clears it.</p>
+<form class="keybox" hx-get="{{.ViewURL}}" hx-target="#app" hx-swap="innerHTML">
+<input type="password" id="key" autocomplete="off" placeholder="Management key" aria-label="Management key" required>
+<button class="small" type="submit">Connect</button>
+</form>
+<noscript><p class="notice err">This page needs JavaScript: it sends the management key in a request header.</p></noscript>
+</section>
+
+<p class="notice err" id="error" role="alert"></p>
+<div id="app"></div>
+<div id="write" hidden></div>
+</main>
+</body>
+</html>
+{{end}}

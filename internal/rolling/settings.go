@@ -178,7 +178,7 @@ func ParseSettings(raw []byte) (Settings, error) {
 	if in.MetaInterval != nil {
 		out.MetaInterval = *in.MetaInterval
 	}
-	if err := out.validate(); err != nil {
+	if err := out.Validate(); err != nil {
 		return Settings{}, err
 	}
 	for id := range in.Providers {
@@ -211,19 +211,33 @@ func ParseSettings(raw []byte) (Settings, error) {
 	return out, nil
 }
 
-func (s Settings) validate() error {
+// FieldError is a settings error for one field. Field is the config key.
+type FieldError struct {
+	Field   string
+	Message string
+}
+
+func (e *FieldError) Error() string { return e.Message }
+
+// ParseDuration reads a Go duration string or integer seconds. An empty value is zero.
+func ParseDuration(raw string) (time.Duration, error) { return parseDuration(raw) }
+
+// Validate checks the timing fields against their bounds. ParseSettings and
+// the status page use it, so both apply the same rules. The error is a
+// *FieldError.
+func (s Settings) Validate() error {
 	minDelay, maxDelay, stagger := time.Duration(s.DelayMin), time.Duration(s.DelayMax), time.Duration(s.Stagger)
 	switch {
 	case minDelay < MinDelay:
-		return fmt.Errorf("delay_min %s is below %s", minDelay, MinDelay)
+		return &FieldError{"delay_min", fmt.Sprintf("delay_min %s is below %s", minDelay, MinDelay)}
 	case maxDelay < minDelay:
-		return fmt.Errorf("delay_max %s is below delay_min %s", maxDelay, minDelay)
+		return &FieldError{"delay_max", fmt.Sprintf("delay_max %s is below delay_min %s", maxDelay, minDelay)}
 	case maxDelay > MaxDelay:
-		return fmt.Errorf("delay_max %s is above %s", maxDelay, MaxDelay)
+		return &FieldError{"delay_max", fmt.Sprintf("delay_max %s is above %s", maxDelay, MaxDelay)}
 	case stagger < 0 || stagger > MaxStagger:
-		return fmt.Errorf("stagger %s is outside 0s to %s", stagger, MaxStagger)
+		return &FieldError{"stagger", fmt.Sprintf("stagger %s is outside 0s to %s", stagger, MaxStagger)}
 	case time.Duration(s.MetaInterval) < MinMetaInterval || time.Duration(s.MetaInterval) > MaxMetaInterval:
-		return fmt.Errorf("meta_interval %s is outside %s to %s", time.Duration(s.MetaInterval), MinMetaInterval, MaxMetaInterval)
+		return &FieldError{"meta_interval", fmt.Sprintf("meta_interval %s is outside %s to %s", time.Duration(s.MetaInterval), MinMetaInterval, MaxMetaInterval)}
 	}
 	return nil
 }

@@ -118,16 +118,25 @@ provider key is an error.
 ## Status page
 
 **Keep Rolling** in the Management Center sidebar
-(`/v0/resource/plugins/keep-rolling/status`). It asks for the management key
-and keeps it in `sessionStorage` for the tab only. It shows, for each account:
-provider, last ping and its result, weekly use and reset, last reset seen, next ping, host
-cooldown, and a **Ping now** button. Providers can be switched on and off and
-their model set. Saves go through
+(`/v0/resource/plugins/keep-rolling/status`). The page is server-rendered HTML
+driven by htmx 2.0.11 (vendored, no CDN); see [docs/ui.md](docs/ui.md) for
+routes, validation, the script exception and tests. It asks for the
+management key and keeps it in memory only: reloading the page clears it. It
+needs JavaScript to send the key.
+
+It shows, for each account: provider, last ping and its result, weekly use and
+reset, last reset seen, next ping, host cooldown, and a **Ping now** button.
+Every column sorts on the server; the table refreshes every 15 seconds while
+the tab is visible and keeps its sort. Accounts can be kept rolling or not,
+providers can be switched on and off and their model set, and the settings
+form is validated on the server (for example `meta_interval` 5m to 24h). A
+valid change is saved through
 `PATCH /v0/management/plugins/keep-rolling/config` (shallow merge; the page
 sends the whole `providers` object).
 
 Management API: `GET /v0/management/keep-rolling/state`,
-`POST /v0/management/keep-rolling/ping` with `{"id": "<auth id>"}`.
+`POST /v0/management/keep-rolling/ping` with `{"id": "<auth id>"}` (JSON;
+with `HX-Request: true` it returns the HTML fragment instead).
 
 ## Build (linux/arm64)
 
@@ -138,13 +147,13 @@ export GOTOOLCHAIN=local
 go vet ./...
 go test -race ./...
 CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -trimpath -buildmode=c-shared \
-  -ldflags "-s -w -X main.pluginVersion=0.5.0" \
-  -o dist/keep-rolling-v0.5.0-linux-arm64.so .
+  -ldflags "-s -w -X main.pluginVersion=0.6.0" \
+  -o dist/keep-rolling-v0.6.0-linux-arm64.so .
 ```
 
 The host takes the plugin ID and version from the file name
 `<id>-v<version>.so`. Install the library as
-`plugins/linux/arm64/keep-rolling-v0.5.0.so`. The host hot-reloads a plugin
+`plugins/linux/arm64/keep-rolling-v0.6.0.so`. The host hot-reloads a plugin
 only when its file path changes.
 
 Before installing, remove the old `claude-keep-rolling` plugin. Its ID differs,

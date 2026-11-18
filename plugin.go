@@ -1,10 +1,10 @@
 package main
 
 import (
-	_ "embed"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/bogorad/claude-keep-rolling/internal/provider"
@@ -20,13 +20,16 @@ const (
 	pluginID   = "keep-rolling"
 	repository = "https://github.com/bogorad/claude-keep-rolling"
 
-	statePath  = "/v0/management/" + pluginID + "/state"
-	pingPath   = "/v0/management/" + pluginID + "/ping"
-	statusPath = "/status"
+	managementBase = "/v0/management/" + pluginID
+	statePath      = managementBase + "/state"
+	pingPath       = managementBase + "/ping"
+	viewPath       = managementBase + "/view"
+	tablePath      = managementBase + "/table"
+	settingsPath   = managementBase + "/settings"
+	providerPath   = managementBase + "/provider"
+	selectPath     = managementBase + "/select"
+	statusPath     = "/status"
 )
-
-//go:embed status.html
-var statusPage []byte
 
 type lifecycleRequest struct {
 	ConfigYAML []byte `json:"config_yaml"`
@@ -60,9 +63,11 @@ type managementResource struct {
 }
 
 type managementRequest struct {
-	Method string `json:"Method"`
-	Path   string `json:"Path"`
-	Body   []byte `json:"Body"`
+	Method  string      `json:"Method"`
+	Path    string      `json:"Path"`
+	Headers http.Header `json:"Headers"`
+	Query   url.Values  `json:"Query"`
+	Body    []byte      `json:"Body"`
 }
 
 type managementResponse struct {
@@ -93,10 +98,17 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(managementRegistration{
 			Routes: []managementRoute{
 				{Method: http.MethodGet, Path: statePath, Description: "Accounts, providers, settings and ping schedule."},
-				{Method: http.MethodPost, Path: pingPath, Description: "Ping one account now."},
+				{Method: http.MethodPost, Path: pingPath, Description: "Ping one account now. JSON, or the accounts fragment for htmx."},
+				{Method: http.MethodGet, Path: viewPath, Description: "Status page fragment: accounts, providers and settings."},
+				{Method: http.MethodGet, Path: tablePath, Description: "Status page fragment: the accounts table, sorted."},
+				{Method: http.MethodPost, Path: settingsPath, Description: "Status page fragment: validate the settings form."},
+				{Method: http.MethodPost, Path: providerPath, Description: "Status page fragment: validate one provider change."},
+				{Method: http.MethodPost, Path: selectPath, Description: "Status page fragment: keep one account rolling or not."},
 			},
 			Resources: []managementResource{
 				{Path: statusPath, Menu: "Keep Rolling", Description: "Starts each account's weekly usage window right after its reset."},
+				{Path: htmxPath, Description: "htmx " + htmxVersion + " for the status page."},
+				{Path: jsonEncPath, Description: "htmx json-enc " + jsonEncVersion + " for the status page."},
 			},
 		})
 	case pluginabi.MethodManagementHandle:
@@ -135,16 +147,29 @@ func pluginRegistration() registration {
 
 func handleManagement(req managementRequest) managementResponse {
 	switch {
-	case req.Method == http.MethodGet && req.Path == "/v0/resource/plugins/"+pluginID+statusPath:
-		return managementResponse{
-			StatusCode: http.StatusOK,
-			Headers:    http.Header{"Content-Type": {"text/html; charset=utf-8"}, "Cache-Control": {"no-store"}},
-			Body:       statusPage,
-		}
+	case req.Method == http.MethodGet && req.Path == resourceBase+statusPath:
+		return renderPage()
+	case req.Method == http.MethodGet && req.Path == resourceBase+htmxPath:
+		return assetResponse(htmxJS)
+	case req.Method == http.MethodGet && req.Path == resourceBase+jsonEncPath:
+		return assetResponse(jsonEncJS)
 	case req.Method == http.MethodGet && req.Path == statePath:
 		return jsonResponse(http.StatusOK, buildState(time.Now()))
 	case req.Method == http.MethodPost && req.Path == pingPath:
+		if isHTMX(req) {
+			return handlePingHTML(req)
+		}
 		return handlePing(req)
+	case req.Method == http.MethodGet && req.Path == viewPath:
+		return handleView(req)
+	case req.Method == http.MethodGet && req.Path == tablePath:
+		return handleTable(req)
+	case req.Method == http.MethodPost && req.Path == settingsPath:
+		return handleSettings(req)
+	case req.Method == http.MethodPost && req.Path == providerPath:
+		return handleProvider(req)
+	case req.Method == http.MethodPost && req.Path == selectPath:
+		return handleSelect(req)
 	default:
 		return jsonResponse(http.StatusNotFound, map[string]string{"error": "not found"})
 	}
@@ -204,12 +229,18 @@ type stateView struct {
 
 func buildState(now time.Time) stateView {
 	settings, configError := keeper.currentSettings()
+	return buildStateWith(now, settings, configError)
+}
+
+// buildStateWith builds the state for the given settings. The status page
+// uses it to draw a change it has just sent to the host config.
+func buildStateWith(now time.Time, settings rolling.Settings, configError string) stateView {
 	defaults, _ := rolling.ParseSettings(nil)
 	view := stateView{
 		Version: pluginVersion, Now: now.UTC(), Settings: settings, Defaults: defaults,
 		ConfigError: configError, Providers: providerViews(settings, now), Accounts: []accountView{},
 	}
-	accounts, err := listAccounts()
+	accounts, err := accountSource()
 	if err != nil {
 		view.ListError = err.Error()
 		return view
@@ -280,28 +311,38 @@ func handlePing(req managementRequest) managementResponse {
 	if err := json.Unmarshal(req.Body, &body); err != nil || body.ID == "" {
 		return jsonResponse(http.StatusBadRequest, map[string]string{"error": "body must be {\"id\": \"<account id>\"}"})
 	}
-	accounts, err := listAccounts()
+	if status, message := runManualPing(body.ID); status != http.StatusOK {
+		return jsonResponse(status, map[string]string{"error": message})
+	}
+	return jsonResponse(http.StatusOK, buildState(time.Now()))
+}
+
+// runManualPing pings one account and waits for the result. It returns 200,
+// or an error status and message: 404 unknown account, 409 conflict, 502 the
+// host could not list accounts.
+func runManualPing(id string) (int, string) {
+	accounts, err := accountSource()
 	if err != nil {
-		return jsonResponse(http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return http.StatusBadGateway, err.Error()
 	}
 	for _, account := range accounts {
-		if account.entry.ID != body.ID {
+		if account.entry.ID != id {
 			continue
 		}
 		if account.entry.Disabled {
-			return jsonResponse(http.StatusConflict, map[string]string{"error": "account is disabled"})
+			return http.StatusConflict, "account is disabled"
 		}
 		if !provider.CanPing(account.adapter) {
-			return jsonResponse(http.StatusConflict, map[string]string{"error": account.adapter.Name() + " has no ping: " + account.adapter.Note()})
+			return http.StatusConflict, account.adapter.Name() + " has no ping: " + account.adapter.Note()
 		}
 		if !keeper.claim(account) {
-			return jsonResponse(http.StatusConflict, map[string]string{"error": "a ping is already running for this account"})
+			return http.StatusConflict, "a ping is already running for this account"
 		}
 		settings, _ := keeper.currentSettings()
 		keeper.ping(account, settings, true)
-		return jsonResponse(http.StatusOK, buildState(time.Now()))
+		return http.StatusOK, ""
 	}
-	return jsonResponse(http.StatusNotFound, map[string]string{"error": "account not found"})
+	return http.StatusNotFound, "account not found"
 }
 
 func jsonResponse(status int, v any) managementResponse {

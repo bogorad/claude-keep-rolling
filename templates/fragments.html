@@ -1,0 +1,112 @@
+{{/* Fragments for the authenticated management routes. See docs/ui.md. */}}
+
+{{define "view" -}}
+<section>
+<div class="bar"><h2>Accounts</h2></div>
+{{template "accounts" .Accounts}}
+</section>
+<section>
+<div class="bar"><h2>Providers</h2></div>
+{{template "providers" .Providers}}
+</section>
+<section>
+<div class="bar"><h2>Settings</h2></div>
+{{template "settings" .Settings}}
+</section>
+{{template "status-oob" .Status}}
+{{- end}}
+
+{{define "status-oob" -}}
+<span class="version" id="version" hx-swap-oob="true">v{{.Version}}</span>
+<p class="notice err" id="error" role="alert" hx-swap-oob="true">{{.Error}}</p>
+<span id="key-status" hx-swap-oob="true">Connected</span>
+{{- end}}
+
+{{define "write-oob" -}}
+<div id="write" hidden hx-swap-oob="true">{{with .}}<div hx-patch="{{.URL}}" hx-ext="json-enc" hx-vals="{{.JSON}}" hx-trigger="load" hx-swap="none"></div>{{end}}</div>
+{{- end}}
+
+{{define "accounts-fragment" -}}
+{{template "accounts" .Accounts}}
+{{template "status-oob" .Status}}
+{{template "write-oob" .Write}}
+{{- end}}
+
+{{define "accounts" -}}
+<div id="accounts" class="accounts" hx-get="{{.RefreshURL}}" hx-trigger="every {{.Poll}} [!document.hidden]" hx-target="this" hx-swap="outerHTML" hx-sync="this:abort">
+{{- if .Notice}}<p class="notice{{if .NoticeErr}} err{{end}}" role="status">{{.Notice}}</p>{{end}}
+{{- if .Rows}}
+<table hx-sync="closest .accounts:replace">
+<thead><tr>
+{{- range .Headers}}<th scope="col" aria-sort="{{.AriaSort}}"><button type="button" class="sort" hx-get="{{.URL}}">{{.Label}}<span class="arrow" aria-hidden="true">{{.Arrow}}</span></button></th>{{end -}}
+</tr></thead>
+<tbody>
+{{- range .Rows}}
+<tr>
+<td><form hx-post="{{$.SelectURL}}" hx-trigger="change"><input type="hidden" name="account" value="{{.ID}}"><input type="hidden" name="sort" value="{{$.Spec.Column}}"><input type="hidden" name="dir" value="{{$.Spec.Dir}}"><input type="checkbox" name="on" value="1" aria-label="Keep {{.Name}} rolling"{{if .Selected}} checked{{end}}{{if .Disabled}} disabled{{end}}></form></td>
+<td>{{.Name}}{{if .Disabled}}<span class="tag">Disabled</span>{{end}}</td>
+<td>{{.ProviderName}}{{with .ProviderNote}}<small>{{.}}</small>{{end}}</td>
+{{template "cell" .LastPing}}
+{{template "cell" .Weekly}}
+{{template "cell" .LastReset}}
+{{template "cell" .NextPing}}
+{{template "cell" .Cooldown}}
+<td><form hx-post="{{$.PingURL}}" hx-disabled-elt="find button"><input type="hidden" name="id" value="{{.ID}}"><input type="hidden" name="sort" value="{{$.Spec.Column}}"><input type="hidden" name="dir" value="{{$.Spec.Dir}}"><button class="small" type="submit"{{if not .CanPingNow}} disabled{{end}}>{{if .Pinging}}Pinging...{{else}}Ping now{{end}}</button></form></td>
+</tr>
+{{- end}}
+</tbody>
+</table>
+{{- else if .Listed}}
+<p class="empty">No supported accounts in CLIProxyAPI yet.</p>
+{{- end}}
+</div>
+{{- end}}
+
+{{define "cell" -}}
+<td{{with .Title}} title="{{.}}"{{end}}>{{if .Class}}<span class="{{.Class}}">{{.Text}}</span>{{else}}{{.Text}}{{end}}{{range .Notes}}<small>{{.}}</small>{{end}}</td>
+{{- end}}
+
+{{define "providers-fragment" -}}
+{{template "providers" .}}
+{{template "write-oob" .Write}}
+{{- end}}
+
+{{define "providers" -}}
+<div id="providers" hx-target="this" hx-swap="outerHTML">
+{{- if .Notice}}<p class="notice{{if .NoticeErr}} err{{end}}" role="status">{{.Notice}}</p>{{end}}
+<table>
+<thead><tr><th scope="col">On</th><th scope="col">Provider</th><th scope="col">Model</th><th scope="col">Accounts</th><th scope="col">Notes</th></tr></thead>
+<tbody>
+{{- range .Rows}}
+<tr>
+<td><form hx-post="{{$.URL}}" hx-trigger="change"><input type="hidden" name="provider" value="{{.ID}}"><input type="hidden" name="field" value="enabled"><input type="checkbox" name="enabled" aria-label="Enable {{.Name}}"{{if .Enabled}} checked{{end}}></form></td>
+<td>{{.Name}}<small>{{.Mode}}</small></td>
+<td><form hx-post="{{$.URL}}" hx-trigger="change"><input type="hidden" name="provider" value="{{.ID}}"><input type="hidden" name="field" value="model"><input type="text" name="model" value="{{.Model}}" placeholder="{{.DefaultModel}}" aria-label="{{.Name}} model"{{if not .CanPing}} disabled{{end}}></form></td>
+<td><form hx-post="{{$.URL}}"><input type="hidden" name="provider" value="{{.ID}}"><input type="hidden" name="field" value="select_all"><input type="hidden" name="select_all" value="{{if .SelectAll}}off{{else}}on{{end}}"><button class="small" type="submit">{{if .SelectAll}}All selected{{else}}Select all{{end}}</button></form></td>
+<td>{{.Note}}</td>
+</tr>
+{{- end}}
+</tbody>
+</table>
+</div>
+{{- end}}
+
+{{define "settings-fragment" -}}
+{{template "settings" .}}
+{{template "write-oob" .Write}}
+{{- end}}
+
+{{define "settings" -}}
+<div id="settings">
+<form hx-post="{{.URL}}" hx-target="#settings" hx-swap="outerHTML">
+{{- if .Notice}}<p class="notice{{if .NoticeErr}} err{{end}}" role="status">{{.Notice}}</p>{{end}}
+<div class="fields">
+{{- range .Fields}}
+<label class="field"><span>{{.Label}}</span><input type="text" name="{{.Name}}" value="{{.Value}}"{{if .Error}} aria-invalid="true" aria-describedby="error-{{.Name}}"{{end}}>{{if .Error}}<small class="err" id="error-{{.Name}}">{{.Error}}</small>{{else}}<small>{{.Hint}}</small>{{end}}</label>
+{{- end}}
+<label class="field"><span>Cooldown reset at weekly reset</span><input type="checkbox" name="cooldown_reset"{{if .CooldownReset}} checked{{end}}></label>
+</div>
+<div class="actions"><button class="small" type="submit">Save settings</button></div>
+</form>
+</div>
+{{- end}}

@@ -4,12 +4,13 @@
 
 | Path | Contents |
 | --- | --- |
-| `plugin.go` | Registration, management routes and the plugin page |
+| `plugin.go` | Registration, management routes and the JSON API |
+| `ui.go`, `templates/` | The status page: htmx fragments, sorting and form validation ([docs/ui.md](docs/ui.md)) |
+| `assets/htmx/` | Vendored htmx and its json-enc extension, with their licenses |
 | `roller.go` | The scheduler that pings each account |
 | `internal/provider` | One adapter per provider: account filter, minimal ping, weekly reset parser |
 | `internal/rolling` | Host-independent rules: settings, account selection, ping timing, stagger and cooldown-reset decision |
 | `main.go`, `entry.c`, `abi.h` | The C ABI between CLIProxyAPI and the plugin |
-| `status.html` | The plugin page, embedded in the library |
 | `test/faulthost` | A minimal Go host that loads the plugin the way CLIProxyAPI does and checks that it still recovers its own faults |
 
 ## Test

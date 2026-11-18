@@ -71,7 +71,7 @@ done
 grep -q "\"version\":\"$VERSION\"" <<<"$state" || fail "state does not report version $VERSION: $state"
 echo "ok: plugin registered and reports version $VERSION"
 
-curl -sf "$base/v0/resource/plugins/keep-rolling/status" | grep -q '<div id="providers">' || fail "status page not served"
+curl -sf "$base/v0/resource/plugins/keep-rolling/status" | grep -q '<div id="app"></div>' || fail "status page not served"
 echo "ok: status page served"
 
 code=$(curl -s -o /dev/null -w '%{http_code}' "$base/v0/management/keep-rolling/state")
