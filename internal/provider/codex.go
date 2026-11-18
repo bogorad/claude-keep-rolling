@@ -30,6 +30,7 @@ func (codex) ID() string             { return "codex" }
 func (codex) Name() string           { return "Codex" }
 func (codex) DefaultModel() string   { return "gpt-6-luna" }
 func (codex) StartsOnFirstUse() bool { return true }
+func (codex) PingsOnInterval() bool  { return false }
 func (codex) DefaultEnabled() bool   { return true }
 func (codex) FixedReset(time.Time) time.Time {
 	return time.Time{}

@@ -41,7 +41,7 @@ input[type=text],input[type=password]{font:inherit;padding:6px 8px;border-radius
 <body>
 <main>
 <div class="head"><h1>Keep Rolling</h1><span class="version" id="version"></span></div>
-<p class="sub">Starts each selected account's weekly usage window right after its reset, plus a random delay. Only providers whose weekly window starts on first use are pinged. At a reset, an active host cooldown for the account can be cleared once.</p>
+<p class="sub">Starts each selected account's weekly usage window right after its reset, plus a random delay. Only providers whose weekly window starts on first use are pinged at the reset. Meta is pinged on a fixed interval instead, first at plugin start. At a reset, an active host cooldown for the account can be cleared once.</p>
 
 <section id="key-section" hidden>
 <div class="bar"><h2>Management key</h2></div>
@@ -67,6 +67,7 @@ input[type=text],input[type=password]{font:inherit;padding:6px 8px;border-radius
 <label class="field"><span>Delay after reset, min</span><input type="text" id="delay_min"></label>
 <label class="field"><span>Delay after reset, max</span><input type="text" id="delay_max"></label>
 <label class="field"><span>Stagger after start</span><input type="text" id="stagger"></label>
+<label class="field"><span>Meta ping interval</span><input type="text" id="meta_interval"></label>
 <label class="field"><span>Cooldown reset at weekly reset</span><input type="checkbox" id="cooldown_reset"></label>
 </div>
 </section>
@@ -145,7 +146,7 @@ function render(){
   renderAccounts(now);
   renderProviders(now);
   var s=state.settings;
-  ["prompt","delay_min","delay_max","stagger"].forEach(function(id){if(document.activeElement!==$(id))$(id).value=s[id];});
+  ["prompt","delay_min","delay_max","stagger","meta_interval"].forEach(function(id){if(document.activeElement!==$(id))$(id).value=s[id];});
   $("cooldown_reset").checked=!!s.cooldown_reset;
 }
 
@@ -178,6 +179,7 @@ function renderAccounts(now){
       last.appendChild(el("span",acc.last_ok?"ok":"err",(acc.last_ok?"OK ":"Failed ")+rel(acc.last_ping_at,now)));
       last.title=abs(acc.last_ping_at);
       if(acc.last_error){last.appendChild(el("small","",acc.last_error));}
+      if(acc.last_result){last.appendChild(el("small","",acc.last_result));}
     }else last.appendChild(el("span","muted","Never"));
     tr.appendChild(last);
 
@@ -226,7 +228,7 @@ function renderProviders(){
     on.addEventListener("change",function(){saveProvider(info.id,{enabled:on.checked});});
     tdOn.appendChild(on);tr.appendChild(tdOn);
     var name=el("td","",info.name);
-    name.appendChild(el("small","",info.starts_on_first_use?"window starts on first use":"window not started by pings"));
+    name.appendChild(el("small","",info.ping_interval?"pinged every "+info.ping_interval:info.starts_on_first_use?"window starts on first use":"window not started by pings"));
     tr.appendChild(name);
     var tdModel=el("td"),model=el("input");model.type="text";model.value=p.model;model.placeholder=info.default_model;model.disabled=!info.can_ping;
     model.addEventListener("change",function(){saveProvider(info.id,{model:model.value.trim()||info.default_model});});
@@ -286,7 +288,7 @@ function pingNow(id,btn){
     .catch(function(e){if(e.message!=="unauthorized"){showError("Ping failed: "+e.message);load();}});
 }
 
-["prompt","delay_min","delay_max","stagger"].forEach(function(id){
+["prompt","delay_min","delay_max","stagger","meta_interval"].forEach(function(id){
   $(id).addEventListener("change",function(){
     var v=this.value.trim();
     if(!v)v=state.defaults[id];

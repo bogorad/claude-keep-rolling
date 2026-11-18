@@ -66,7 +66,7 @@ func TestClaimDue(t *testing.T) {
 	r.states["removed"] = &accountState{}
 
 	claimed := ids(r.claimDue(accounts, settings, now))
-	if want := []string{"claude-new", "claude-due", "codex-on"}; !slices.Equal(claimed, want) {
+	if want := []string{"claude-new", "claude-due", "codex-on", "meta-a"}; !slices.Equal(claimed, want) {
 		t.Fatalf("claimed %v, want %v", claimed, want)
 	}
 	for _, id := range claimed {
@@ -80,7 +80,7 @@ func TestClaimDue(t *testing.T) {
 	if _, ok := r.states["removed"]; ok {
 		t.Fatal("state for a removed account should be dropped")
 	}
-	for _, id := range []string{"meta-a", "xai-a", "codex-off", "claude-disabled"} {
+	for _, id := range []string{"xai-a", "codex-off", "claude-disabled"} {
 		if state, ok := r.states[id]; ok && !state.NextPingAt.IsZero() {
 			t.Fatalf("%s must not be scheduled", id)
 		}
@@ -155,8 +155,12 @@ func TestCooldownsToReset(t *testing.T) {
 		t.Fatal("a cooldown that starts after the decision must be left alone")
 	}
 
-	if got := ids(r.cooldownsToReset([]tracked{metaCooled}, settings, monday)); !slices.Equal(got, []string{"meta-cooled"}) {
-		t.Fatalf("meta at the Monday reset: %v", got)
+	// meta is an interval provider: its cooldown is never cleared, even at the Monday reset.
+	if got := ids(r.cooldownsToReset([]tracked{metaCooled}, settings, monday)); len(got) != 0 {
+		t.Fatalf("meta cooldown must not be cleared: %v", got)
+	}
+	if state := r.states["meta-cooled"]; !state.CooldownResetFor.IsZero() || !state.LastResetSeen.Equal(time.Date(2026, 11, 16, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("meta state after the Monday reset: %+v", state)
 	}
 
 	off := testSettings(t, "cooldown_reset: false\n")
@@ -237,5 +241,84 @@ func TestRegistrationDeclaresOnlyManagement(t *testing.T) {
 	}
 	if reg.Metadata.Name != "Keep Rolling" || pluginID != "keep-rolling" {
 		t.Fatalf("unexpected identity %q %q", reg.Metadata.Name, pluginID)
+	}
+}
+
+func TestClaimDueMetaPingsAtStartWithoutStagger(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	r := newRoller()
+	r.random = func() float64 { return 0 }
+	settings := testSettings(t, "stagger: 2m\nproviders:\n  meta:\n    enabled: true\n")
+	accounts := []tracked{account("a", "claude"), account("b", "claude"), account("m", "meta")}
+
+	claimed := ids(r.claimDue(accounts, settings, now))
+	if want := []string{"a", "m"}; !slices.Equal(claimed, want) {
+		t.Fatalf("claimed %v, want %v", claimed, want)
+	}
+	if got := r.states["m"].NextPingAt; !got.Equal(now) {
+		t.Fatalf("meta first ping at %s, want now", got)
+	}
+	// meta takes no stagger slot, so b keeps the first slot after a.
+	if got := r.states["b"].NextPingAt; !got.Equal(now.Add(2 * time.Minute)) {
+		t.Fatalf("b slot %s", got)
+	}
+
+	// Meta off (the default): no meta ping.
+	r2 := newRoller()
+	r2.random = func() float64 { return 0 }
+	if got := ids(r2.claimDue([]tracked{account("m", "meta")}, testSettings(t, ""), now)); len(got) != 0 {
+		t.Fatalf("meta is off by default, claimed %v", got)
+	}
+}
+
+func TestClaimDueMetaWaitsForCooldown(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	r := newRoller()
+	settings := testSettings(t, "providers:\n  meta:\n    enabled: true\n")
+	cooling := account("m", "meta")
+	cooling.entry.NextRetryAfter = now.Add(90 * time.Minute)
+	if got := r.claimDue([]tracked{cooling}, settings, now); len(got) != 0 {
+		t.Fatalf("a cooling meta account must not be pinged: %v", ids(got))
+	}
+	if got := r.states["m"].NextPingAt; !got.Equal(now.Add(90*time.Minute + rolling.ResetBuffer)) {
+		t.Fatalf("meta deferred to %s", got)
+	}
+}
+
+func TestPingInterval(t *testing.T) {
+	settings := testSettings(t, "meta_interval: 45m\n")
+	if got := pingInterval(account("m", "meta").adapter, settings); got != 45*time.Minute {
+		t.Fatalf("meta interval %s", got)
+	}
+	if got := pingInterval(account("m", "meta").adapter, testSettings(t, "")); got != time.Hour {
+		t.Fatalf("default meta interval %s", got)
+	}
+	for _, id := range []string{"claude", "codex"} {
+		if got := pingInterval(account("x", id).adapter, settings); got != 0 {
+			t.Fatalf("%s must not ping on an interval: %s", id, got)
+		}
+	}
+}
+
+func TestReadReply(t *testing.T) {
+	at := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	metaAdapter := account("m", "meta").adapter
+	codexAdapter := account("c", "codex").adapter
+	reply := func(status int, body string) pluginapi.HostModelExecutionResponse {
+		return pluginapi.HostModelExecutionResponse{StatusCode: status, Body: []byte(body)}
+	}
+
+	_, result, status, err := readReply(metaAdapter, reply(200, `{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":9,"output_tokens":16}}`), at)
+	if err != nil || status != 200 || result != "incomplete (max_output_tokens), 9+16 tokens" {
+		t.Fatalf("meta incomplete at the cap: %q %d %v", result, status, err)
+	}
+	if _, _, status, err := readReply(metaAdapter, reply(200, `{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}`), at); err == nil || status != 200 {
+		t.Fatalf("meta incomplete for another reason must fail: %d %v", status, err)
+	}
+	if _, _, status, err := readReply(metaAdapter, reply(429, `{"error":"quota"}`), at); err == nil || status != 429 {
+		t.Fatalf("meta 429 must fail: %d %v", status, err)
+	}
+	if _, result, status, err := readReply(codexAdapter, reply(200, ``), at); err != nil || status != 200 || result != "" {
+		t.Fatalf("codex must not read the body: %q %d %v", result, status, err)
 	}
 }

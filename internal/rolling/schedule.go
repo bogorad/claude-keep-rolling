@@ -72,10 +72,14 @@ type Outcome struct {
 	// ping that was already planned when it started.
 	Manual    bool
 	Scheduled time.Time
+	// Interval is set for interval providers (meta). A success then schedules
+	// the next ping at At + Interval, with no jitter, and ignores the weekly reset.
+	Interval time.Duration
 }
 
 // NextPing returns when the account should be pinged again.
 //
+//   - Success for an interval provider (Interval > 0): At + Interval.
 //   - Success with a reset ahead (within the window plus slack): reset + Delay.
 //   - Success with a reset at or up to SkewTolerance before the ping: the ping
 //     landed in the old window; retry after SkewRetry.
@@ -95,6 +99,9 @@ func NextPing(o Outcome) time.Time {
 			}
 		}
 		return next
+	}
+	if o.Interval > 0 {
+		return o.At.Add(o.Interval)
 	}
 	reset := o.Weekly.Reset
 	window := o.Weekly.Window

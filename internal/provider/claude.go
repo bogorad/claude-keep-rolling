@@ -22,6 +22,7 @@ func (claude) DefaultModel() string { return "claude-haiku-4-5-20251001" }
 func (claude) StartsOnFirstUse() bool {
 	return true
 }
+func (claude) PingsOnInterval() bool          { return false }
 func (claude) DefaultEnabled() bool           { return true }
 func (claude) FixedReset(time.Time) time.Time { return time.Time{} }
 func (claude) Note() string {

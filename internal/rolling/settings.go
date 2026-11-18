@@ -20,6 +20,12 @@ const (
 	DefaultDelayMin = time.Minute
 	DefaultDelayMax = 10 * time.Minute
 	DefaultStagger  = 2 * time.Minute
+	// DefaultMetaInterval is the fixed gap between meta pings.
+	DefaultMetaInterval = 60 * time.Minute
+
+	// MinMetaInterval and MaxMetaInterval bound meta_interval.
+	MinMetaInterval = 5 * time.Minute
+	MaxMetaInterval = 24 * time.Hour
 
 	// MinDelay is the smallest allowed delay after a reset. A ping exactly at
 	// the reported reset can land in the old window.
@@ -105,6 +111,8 @@ type Settings struct {
 	DelayMax Duration `json:"delay_max"`
 	// Stagger is the minimum gap between first pings after a start.
 	Stagger Duration `json:"stagger"`
+	// MetaInterval is the fixed gap between pings for interval providers (meta).
+	MetaInterval Duration `json:"meta_interval"`
 	// CooldownReset clears an active host cooldown once, right after a weekly reset.
 	CooldownReset bool                        `json:"cooldown_reset"`
 	Providers     map[string]ProviderSettings `json:"providers"`
@@ -131,6 +139,7 @@ type rawSettings struct {
 	DelayMax      *Duration              `yaml:"delay_max"`
 	Stagger       *Duration              `yaml:"stagger"`
 	CooldownReset *bool                  `yaml:"cooldown_reset"`
+	MetaInterval  *Duration              `yaml:"meta_interval"`
 	Providers     map[string]rawProvider `yaml:"providers"`
 }
 
@@ -147,6 +156,7 @@ func ParseSettings(raw []byte) (Settings, error) {
 		DelayMin:      Duration(DefaultDelayMin),
 		DelayMax:      Duration(DefaultDelayMax),
 		Stagger:       Duration(DefaultStagger),
+		MetaInterval:  Duration(DefaultMetaInterval),
 		CooldownReset: true,
 		Providers:     map[string]ProviderSettings{},
 	}
@@ -164,6 +174,9 @@ func ParseSettings(raw []byte) (Settings, error) {
 	}
 	if in.CooldownReset != nil {
 		out.CooldownReset = *in.CooldownReset
+	}
+	if in.MetaInterval != nil {
+		out.MetaInterval = *in.MetaInterval
 	}
 	if err := out.validate(); err != nil {
 		return Settings{}, err
@@ -209,6 +222,8 @@ func (s Settings) validate() error {
 		return fmt.Errorf("delay_max %s is above %s", maxDelay, MaxDelay)
 	case stagger < 0 || stagger > MaxStagger:
 		return fmt.Errorf("stagger %s is outside 0s to %s", stagger, MaxStagger)
+	case time.Duration(s.MetaInterval) < MinMetaInterval || time.Duration(s.MetaInterval) > MaxMetaInterval:
+		return fmt.Errorf("meta_interval %s is outside %s to %s", time.Duration(s.MetaInterval), MinMetaInterval, MaxMetaInterval)
 	}
 	return nil
 }

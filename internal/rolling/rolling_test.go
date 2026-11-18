@@ -15,7 +15,7 @@ func TestParseSettingsDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if settings.Prompt != DefaultPrompt || time.Duration(settings.DelayMin) != time.Minute || time.Duration(settings.DelayMax) != 10*time.Minute ||
-		time.Duration(settings.Stagger) != 2*time.Minute || !settings.CooldownReset {
+		time.Duration(settings.Stagger) != 2*time.Minute || !settings.CooldownReset || time.Duration(settings.MetaInterval) != 60*time.Minute {
 		t.Fatalf("unexpected defaults: %+v", settings)
 	}
 	want := map[string]bool{"claude": true, "codex": true, "meta": false, "xai": false, "antigravity": false}
@@ -42,6 +42,7 @@ delay_min: 2m
 delay_max: 900
 stagger: 30s
 cooldown_reset: false
+meta_interval: 30m
 providers:
   claude:
     enabled: false
@@ -59,7 +60,8 @@ providers:
 	if settings.Prompt != "  hello there " {
 		t.Fatalf("prompt should be sent as typed, got %q", settings.Prompt)
 	}
-	if time.Duration(settings.DelayMin) != 2*time.Minute || time.Duration(settings.DelayMax) != 15*time.Minute || time.Duration(settings.Stagger) != 30*time.Second {
+	if time.Duration(settings.DelayMin) != 2*time.Minute || time.Duration(settings.DelayMax) != 15*time.Minute || time.Duration(settings.Stagger) != 30*time.Second ||
+		time.Duration(settings.MetaInterval) != 30*time.Minute {
 		t.Fatalf("durations: %+v", settings)
 	}
 	if settings.CooldownReset {
@@ -91,6 +93,9 @@ func TestParseSettingsErrors(t *testing.T) {
 		{"max above bound", "delay_max: 7h\n"},
 		{"negative stagger", "stagger: -1s\n"},
 		{"stagger above bound", "stagger: 2h\n"},
+		{"meta interval below bound", "meta_interval: 4m\n"},
+		{"meta interval above bound", "meta_interval: 25h\n"},
+		{"meta interval zero", "meta_interval: 0s\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -235,6 +240,12 @@ func TestNextPing(t *testing.T) {
 		{"failed manual ping keeps an earlier schedule", Outcome{At: at, Manual: true, Scheduled: at.Add(time.Minute)}, at.Add(time.Minute)},
 		{"failed manual ping without schedule", Outcome{At: at, Manual: true}, at.Add(RetryAfterFailure)},
 		{"successful manual ping reschedules", Outcome{At: at, OK: true, Manual: true, Scheduled: at.Add(time.Minute), Weekly: weekly(reset), Delay: delay}, reset.Add(delay)},
+		{"interval success ignores reset and delay", Outcome{At: at, OK: true, Weekly: weekly(reset), Delay: delay, Interval: time.Hour}, at.Add(time.Hour)},
+		{"interval success without reset", Outcome{At: at, OK: true, Interval: 30 * time.Minute}, at.Add(30 * time.Minute)},
+		{"interval manual success reschedules", Outcome{At: at, OK: true, Manual: true, Scheduled: at.Add(10 * time.Minute), Interval: time.Hour}, at.Add(time.Hour)},
+		{"interval failure retries", Outcome{At: at, Interval: time.Hour}, at.Add(RetryAfterFailure)},
+		{"interval failure waits for cooldown", Outcome{At: at, Interval: time.Hour, CooldownUntil: at.Add(2 * time.Hour)}, at.Add(2*time.Hour + ResetBuffer)},
+		{"interval failed manual ping keeps the schedule", Outcome{At: at, Manual: true, Scheduled: at.Add(10 * time.Minute), Interval: time.Hour}, at.Add(10 * time.Minute)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

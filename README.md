@@ -31,7 +31,11 @@ upstream is in [AUDIT.md](AUDIT.md). Plugin ID: `keep-rolling`.
   failed manual ping does not move the scheduled ping.
 - A due ping for an account in an active host cooldown waits until the
   cooldown ends, instead of failing into it.
-- There is no five-hour logic.
+- There is no five-hour logic for claude and codex.
+- meta is the exception: it is pinged on a fixed interval (`meta_interval`,
+  default 60m, no jitter), first at plugin start without stagger. A ping
+  after a Muse window ended starts a new window at ping time. The weekly
+  reset rules above do not apply to meta.
 
 ### Cooldown reset
 
@@ -41,7 +45,8 @@ an account's known weekly reset passes (within 1 hour), the plugin checks the
 host's runtime state for the account. If the host shows a cooldown
 (`next_retry_after` in the future, or `unavailable`), it calls
 `host.routing.reset_cooldown` for that account once. The decision is made
-once per reset: a cooldown that starts later is left alone.
+once per reset: a cooldown that starts later is left alone. The plugin never
+clears a meta cooldown; a due meta ping waits until the cooldown ends.
 
 The plugin learns resets only from its own ping replies (or the calendar, for
 meta). `host.auth.list` and `host.auth.get_runtime` do not expose the host's
@@ -53,7 +58,7 @@ saved `quota.signals`, so the plugin cannot learn a reset without a ping.
 | --- | --- | --- | --- |
 | claude | on | yes | `Anthropic-Ratelimit-Unified-7d-Reset` (Unix seconds or RFC 3339); `-7d-Status`, `-7d-Utilization` |
 | codex | on | yes | `X-Codex-Primary-*` / `X-Codex-Secondary-*`: the window of 10080 minutes, else the longest window of at least one day; `-Reset-At` (Unix seconds), else `-Reset-After-Seconds`; `-Used-Percent` |
-| meta | off | no (fixed Monday 00:00 UTC) | calendar; never pinged; cooldown reset at the Monday reset only |
+| meta | off | no (fixed Monday 00:00 UTC) | calendar; pinged every `meta_interval`; never a cooldown reset |
 | xai | off | unknown | none in headers; stub, no ping |
 | antigravity | off | unknown | none known; stub, no ping |
 
@@ -65,6 +70,12 @@ Pings:
   `codex`), `instructions: ""`, `input` = prompt, `max_output_tokens: 16`
   (the Codex minimum), `store: false`. The host sends `stream: true` upstream
   and aggregates the reply. Default model `gpt-6-luna`.
+- meta: OpenAI Responses (`openai-response` in and out, forced provider
+  `meta`), `input: "ping"` (the prompt setting does not apply),
+  `reasoning.effort: minimal`, `max_output_tokens: 16`, `store: false`.
+  Measured cost 2026-11-18: 9 input + 16 output tokens. Default model
+  `muse-spark-1.3-contributor`. A reply with status `incomplete` and reason
+  `max_output_tokens` is a success; other `incomplete` reasons are failures.
 
 Only OAuth accounts are used. API-key accounts and disabled accounts are
 skipped.
@@ -86,6 +97,7 @@ plugins:
       delay_max: 10m        # default; at most 6h
       stagger: 2m           # default; 0s to 1h, 0s turns it off
       cooldown_reset: true  # default
+      meta_interval: 60m    # default; 5m to 24h
       providers:            # every key is optional
         claude:
           enabled: true
@@ -108,7 +120,7 @@ provider key is an error.
 **Keep Rolling** in the Management Center sidebar
 (`/v0/resource/plugins/keep-rolling/status`). It asks for the management key
 and keeps it in `sessionStorage` for the tab only. It shows, for each account:
-provider, last ping, weekly use and reset, last reset seen, next ping, host
+provider, last ping and its result, weekly use and reset, last reset seen, next ping, host
 cooldown, and a **Ping now** button. Providers can be switched on and off and
 their model set. Saves go through
 `PATCH /v0/management/plugins/keep-rolling/config` (shallow merge; the page
@@ -126,13 +138,13 @@ export GOTOOLCHAIN=local
 go vet ./...
 go test -race ./...
 CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -trimpath -buildmode=c-shared \
-  -ldflags "-s -w -X main.pluginVersion=0.4.0" \
-  -o dist/keep-rolling-v0.4.0-linux-arm64.so .
+  -ldflags "-s -w -X main.pluginVersion=0.5.0" \
+  -o dist/keep-rolling-v0.5.0-linux-arm64.so .
 ```
 
 The host takes the plugin ID and version from the file name
 `<id>-v<version>.so`. Install the library as
-`plugins/linux/arm64/keep-rolling-v0.4.0.so`. The host hot-reloads a plugin
+`plugins/linux/arm64/keep-rolling-v0.5.0.so`. The host hot-reloads a plugin
 only when its file path changes.
 
 Before installing, remove the old `claude-keep-rolling` plugin. Its ID differs,

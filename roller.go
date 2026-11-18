@@ -34,6 +34,8 @@ type accountState struct {
 	LastOK     bool
 	LastStatus int
 	LastError  string
+	// LastResult is the adapter's reading of the last successful reply (meta).
+	LastResult string
 	// Weekly comes from the last successful ping.
 	Weekly provider.Weekly
 	// LastResetSeen is the most recent weekly reset the plugin saw pass.
@@ -232,6 +234,10 @@ func (r *roller) cooldownsToReset(accounts []tracked, settings rolling.Settings,
 		if !reset.IsZero() && reset.After(state.LastResetSeen) {
 			state.LastResetSeen = reset
 		}
+		// The plugin never clears the cooldown of an interval provider (meta).
+		if account.adapter.PingsOnInterval() {
+			continue
+		}
 		decide, clear := rolling.CooldownDecision(rolling.CooldownCheck{
 			Now:            now,
 			Enabled:        settings.CooldownReset,
@@ -286,7 +292,12 @@ func (r *roller) claimDue(accounts []tracked, settings rolling.Settings, now tim
 		if state.Pinging {
 			continue
 		}
-		if state.NextPingAt.IsZero() {
+		switch {
+		case !state.NextPingAt.IsZero():
+		case account.adapter.PingsOnInterval():
+			// An interval provider pings at once after a start, without stagger.
+			state.NextPingAt = now
+		default:
 			slot := rolling.NextSlot(now, r.lastSlot, time.Duration(settings.Stagger), r.random())
 			r.lastSlot = slot
 			state.NextPingAt = slot
@@ -353,9 +364,9 @@ func (r *roller) stateLocked(account tracked) *accountState {
 func (r *roller) ping(account tracked, settings rolling.Settings, manual bool) {
 	at := time.Now()
 	p := settings.Provider(account.adapter.ID())
-	weekly, status, err := sendPing(account, p.Model, settings.Prompt, at)
+	weekly, result, status, err := sendPing(account, p.Model, settings.Prompt, at)
 	delay := rolling.Jitter(time.Duration(settings.DelayMin), time.Duration(settings.DelayMax), r.randomLocked())
-	outcome := rolling.Outcome{At: at, OK: err == nil, Weekly: weekly, Delay: delay, Manual: manual}
+	outcome := rolling.Outcome{At: at, OK: err == nil, Weekly: weekly, Delay: delay, Manual: manual, Interval: pingInterval(account.adapter, settings)}
 	if err != nil {
 		outcome.CooldownUntil = cooldownUntil(account.entry.ID)
 	}
@@ -369,6 +380,7 @@ func (r *roller) ping(account tracked, settings rolling.Settings, manual bool) {
 	state.LastOK = err == nil
 	state.LastStatus = status
 	state.LastError = ""
+	state.LastResult = result
 	if err != nil {
 		state.LastError = err.Error()
 	} else {
@@ -389,7 +401,19 @@ func (r *roller) ping(account tracked, settings rolling.Settings, manual bool) {
 	if !weekly.Reset.IsZero() {
 		fields["weekly_reset"] = weekly.Reset.Format(time.RFC3339)
 	}
+	if result != "" {
+		fields["result"] = result
+	}
 	hostLog("info", "keep-rolling ping sent", fields)
+}
+
+// pingInterval returns the fixed ping interval for an interval provider (meta),
+// or zero for providers pinged at the weekly reset.
+func pingInterval(adapter provider.Adapter, settings rolling.Settings) time.Duration {
+	if !adapter.PingsOnInterval() {
+		return 0
+	}
+	return time.Duration(settings.MetaInterval)
 }
 
 // randomLocked draws a random number under the lock, because tests swap r.random.
@@ -413,14 +437,14 @@ func cooldownUntil(accountID string) time.Time {
 	return time.Time{}
 }
 
-// sendPing returns the weekly window from a successful reply and the HTTP status.
-// The host returns a failed reply as an error without its headers. No host
-// callback ID is passed, so a manual ping is not cancelled when its browser
-// request goes away.
-func sendPing(account tracked, model, prompt string, at time.Time) (provider.Weekly, int, error) {
+// sendPing returns the weekly window and the adapter's result from a
+// successful reply, and the HTTP status. The host returns a failed reply as an
+// error without its headers. No host callback ID is passed, so a manual ping
+// is not cancelled when its browser request goes away.
+func sendPing(account tracked, model, prompt string, at time.Time) (provider.Weekly, string, int, error) {
 	req, err := account.adapter.BuildPing(model, prompt)
 	if err != nil {
-		return provider.Weekly{}, 0, err
+		return provider.Weekly{}, "", 0, err
 	}
 	raw, err := callHost(pluginabi.MethodHostModelExecute, pluginapi.HostModelExecutionRequest{
 		EntryProtocol:  req.EntryProtocol,
@@ -434,18 +458,33 @@ func sendPing(account tracked, model, prompt string, at time.Time) (provider.Wee
 	if err != nil {
 		var hostErr *hostError
 		if errors.As(err, &hostErr) {
-			return provider.Weekly{}, hostErr.Status, err
+			return provider.Weekly{}, "", hostErr.Status, err
 		}
-		return provider.Weekly{}, 0, err
+		return provider.Weekly{}, "", 0, err
 	}
 	var resp pluginapi.HostModelExecutionResponse
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		return provider.Weekly{}, 0, fmt.Errorf("decode model response: %w", err)
+		return provider.Weekly{}, "", 0, fmt.Errorf("decode model response: %w", err)
 	}
+	return readReply(account.adapter, resp, at)
+}
+
+// readReply turns a host.model.execute response into the ping result. A
+// status of 400 or more is a failure. An adapter that implements
+// provider.ReplyChecker also judges the body of a successful reply.
+func readReply(adapter provider.Adapter, resp pluginapi.HostModelExecutionResponse, at time.Time) (provider.Weekly, string, int, error) {
 	if resp.StatusCode >= 400 {
-		return provider.Weekly{}, resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(resp.Body), 300))
+		return provider.Weekly{}, "", resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(resp.Body), 300))
 	}
-	return account.adapter.ParseWeekly(resp.Headers, at), resp.StatusCode, nil
+	var result string
+	if checker, ok := adapter.(provider.ReplyChecker); ok {
+		var err error
+		result, err = checker.CheckReply(resp.Body)
+		if err != nil {
+			return provider.Weekly{}, "", resp.StatusCode, err
+		}
+	}
+	return adapter.ParseWeekly(resp.Headers, at), result, resp.StatusCode, nil
 }
 
 type authListResponse struct {

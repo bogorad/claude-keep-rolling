@@ -170,7 +170,7 @@ func TestBuildPing(t *testing.T) {
 		t.Fatalf("codex body = %s", req.Body)
 	}
 
-	for _, adapter := range []Adapter{meta{}, xai{}, antigravity{}} {
+	for _, adapter := range []Adapter{xai{}, antigravity{}} {
 		if _, err := adapter.BuildPing(adapter.DefaultModel(), "hi"); !errors.Is(err, ErrNoPing) {
 			t.Fatalf("%s: BuildPing error = %v, want ErrNoPing", adapter.ID(), err)
 		}
@@ -181,7 +181,7 @@ func TestDefaults(t *testing.T) {
 	want := map[string]struct{ enabled, firstUse, canPing bool }{
 		"claude":      {true, true, true},
 		"codex":       {true, true, true},
-		"meta":        {false, false, false},
+		"meta":        {false, false, true},
 		"xai":         {false, false, false},
 		"antigravity": {false, false, false},
 	}
@@ -193,6 +193,9 @@ func TestDefaults(t *testing.T) {
 		w, ok := want[adapter.ID()]
 		if !ok {
 			t.Fatalf("unexpected adapter %s", adapter.ID())
+		}
+		if adapter.PingsOnInterval() != (adapter.ID() == "meta") {
+			t.Fatalf("%s: PingsOnInterval = %v", adapter.ID(), adapter.PingsOnInterval())
 		}
 		if adapter.DefaultEnabled() != w.enabled || adapter.StartsOnFirstUse() != w.firstUse || CanPing(adapter) != w.canPing {
 			t.Fatalf("%s: enabled %v first-use %v can-ping %v, want %+v", adapter.ID(), adapter.DefaultEnabled(), adapter.StartsOnFirstUse(), CanPing(adapter), w)
@@ -267,5 +270,63 @@ func TestGet(t *testing.T) {
 	}
 	if _, ok := Get("nope"); ok {
 		t.Fatal("Get(nope) should fail")
+	}
+}
+
+func TestMetaBuildPing(t *testing.T) {
+	adapter := meta{}
+	req, err := adapter.BuildPing(adapter.DefaultModel(), "ignored prompt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.EntryProtocol != "openai-response" || req.ExitProtocol != "openai-response" || req.ForcedProvider != "meta" || req.Model != "muse-spark-1.3-contributor" {
+		t.Fatalf("meta request = %+v", req)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(req.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	reasoning, _ := body["reasoning"].(map[string]any)
+	if body["model"] != "muse-spark-1.3-contributor" || body["input"] != "ping" || body["max_output_tokens"] != float64(16) ||
+		body["store"] != false || reasoning["effort"] != "minimal" || body["stream"] != nil || len(body) != 5 {
+		t.Fatalf("meta body = %s", req.Body)
+	}
+	if custom, err := adapter.BuildPing("muse-other", "hi"); err != nil || custom.Model != "muse-other" {
+		t.Fatalf("custom model: %+v %v", custom, err)
+	}
+	if !CanPing(adapter) {
+		t.Fatal("meta must be pingable")
+	}
+}
+
+func TestMetaCheckReply(t *testing.T) {
+	var checker ReplyChecker = meta{}
+	cases := []struct {
+		name    string
+		body    string
+		want    string
+		wantErr bool
+	}{
+		{"incomplete at the token cap", `{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":9,"output_tokens":16}}`, "incomplete (max_output_tokens), 9+16 tokens", false},
+		{"incomplete without usage", `{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}`, "incomplete (max_output_tokens)", false},
+		{"completed", `{"status":"completed","usage":{"input_tokens":9,"output_tokens":3}}`, "completed, 9+3 tokens", false},
+		{"incomplete for another reason", `{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}`, "", true},
+		{"incomplete without reason", `{"status":"incomplete"}`, "", true},
+		{"failed", `{"status":"failed"}`, "", true},
+		{"no status", `{}`, "", true},
+		{"not json", `event: response.completed`, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := checker.CheckReply([]byte(tc.body))
+			if (err != nil) != tc.wantErr || got != tc.want {
+				t.Fatalf("CheckReply = %q, %v; want %q, error %v", got, err, tc.want, tc.wantErr)
+			}
+		})
+	}
+	for _, adapter := range []Adapter{claude{}, codex{}, xai{}, antigravity{}} {
+		if _, ok := adapter.(ReplyChecker); ok {
+			t.Fatalf("%s must not check replies", adapter.ID())
+		}
 	}
 }

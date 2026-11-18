@@ -162,6 +162,8 @@ type accountView struct {
 	LastOK     bool       `json:"last_ok"`
 	LastStatus int        `json:"last_status,omitempty"`
 	LastError  string     `json:"last_error,omitempty"`
+	// LastResult is the adapter's reading of the last successful reply (meta).
+	LastResult string `json:"last_result,omitempty"`
 	// The weekly fields come from the last successful ping.
 	WeeklyResetAt     *time.Time `json:"weekly_reset_at,omitempty"`
 	WeeklyUtilization *float64   `json:"weekly_utilization,omitempty"`
@@ -184,6 +186,8 @@ type providerView struct {
 	DefaultModel     string     `json:"default_model"`
 	FixedResetAt     *time.Time `json:"fixed_reset_at,omitempty"`
 	Note             string     `json:"note"`
+	// PingInterval is set for interval providers (meta), for example "1h0m0s".
+	PingInterval string `json:"ping_interval,omitempty"`
 }
 
 type stateView struct {
@@ -228,6 +232,9 @@ func providerViews(settings rolling.Settings, now time.Time) []providerView {
 			DefaultModel:     adapter.DefaultModel(),
 			Note:             adapter.Note(),
 		}
+		if adapter.PingsOnInterval() {
+			item.PingInterval = time.Duration(settings.MetaInterval).String()
+		}
 		if fixed := adapter.FixedReset(now); !fixed.IsZero() {
 			item.FixedResetAt = timeOrNil(fixed.Add(provider.Week))
 		}
@@ -254,6 +261,7 @@ func buildAccountView(account tracked, settings rolling.Settings) accountView {
 		item.LastOK = state.LastOK
 		item.LastStatus = state.LastStatus
 		item.LastError = state.LastError
+		item.LastResult = state.LastResult
 		item.WeeklyResetAt = timeOrNil(state.Weekly.Reset)
 		item.WeeklyUtilization = state.Weekly.Utilization
 		item.WeeklyReached = state.Weekly.Reached

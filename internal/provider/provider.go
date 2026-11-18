@@ -1,8 +1,9 @@
-// Package provider holds one adapter for each upstream provider whose weekly
-// usage window keep-rolling can track. An adapter knows which host accounts
-// belong to it, how to build a minimal ping for host.model.execute, and how to
-// read the weekly reset from the reply headers. Adapters are host-independent
-// and safe for concurrent use.
+// Package provider holds one adapter for each upstream provider whose usage
+// window keep-rolling can track. An adapter knows which host accounts belong
+// to it, how to build a minimal ping for host.model.execute, and how to read
+// the weekly reset from the reply headers. Most adapters ping right after the
+// weekly reset; an interval adapter (meta) pings on a fixed interval instead.
+// Adapters are host-independent and safe for concurrent use.
 package provider
 
 import (
@@ -68,9 +69,14 @@ type Adapter interface {
 	// the reply arrived, used for relative reset values.
 	ParseWeekly(headers http.Header, at time.Time) Weekly
 	// StartsOnFirstUse reports that the weekly window starts with the first
-	// request after a reset, so a ping right after the reset helps. When
-	// false, the plugin never pings the provider.
+	// request after a reset, so a ping right after the reset helps.
 	StartsOnFirstUse() bool
+	// PingsOnInterval reports that the plugin pings the provider on a fixed
+	// interval (setting meta_interval) instead of at the weekly reset. The
+	// plugin pings a provider only when one of StartsOnFirstUse and
+	// PingsOnInterval is true. It never clears the cooldown of an interval
+	// provider.
+	PingsOnInterval() bool
 	// DefaultEnabled is the provider's enabled flag when settings omit it.
 	DefaultEnabled() bool
 	// FixedReset returns the most recent calendar-fixed weekly reset at or
@@ -78,6 +84,13 @@ type Adapter interface {
 	FixedReset(now time.Time) time.Time
 	// Note explains the adapter's state for the status page.
 	Note() string
+}
+
+// ReplyChecker is implemented by adapters that read the body of a successful
+// reply. CheckReply returns a short result for the status page, or an error
+// when the reply does not count as a successful ping.
+type ReplyChecker interface {
+	CheckReply(body []byte) (string, error)
 }
 
 var adapters = []Adapter{claude{}, codex{}, meta{}, xai{}, antigravity{}}
@@ -109,7 +122,7 @@ func ForAccount(account pluginapi.HostAuthFileEntry) (Adapter, bool) {
 
 // CanPing reports whether the plugin may ping the provider at all.
 func CanPing(adapter Adapter) bool {
-	if !adapter.StartsOnFirstUse() {
+	if !adapter.StartsOnFirstUse() && !adapter.PingsOnInterval() {
 		return false
 	}
 	_, err := adapter.BuildPing(adapter.DefaultModel(), "hi")
