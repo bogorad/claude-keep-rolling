@@ -322,3 +322,15 @@ func TestReadReply(t *testing.T) {
 		t.Fatalf("codex must not read the body: %q %d %v", result, status, err)
 	}
 }
+
+func TestRegistrationDeclaresMetaInterval(t *testing.T) {
+	for _, field := range pluginRegistration().Metadata.ConfigFields {
+		if field.Name == "meta_interval" {
+			if field.Default != "1h0m0s" {
+				t.Fatalf("meta_interval default %v", field.Default)
+			}
+			return
+		}
+	}
+	t.Fatal("meta_interval config field missing")
+}
